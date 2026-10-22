@@ -51,7 +51,23 @@ pub fn print_json(v: &Value) -> Result<(), Error> {
     Ok(())
 }
 
+/// Render one cell value. Multi-line content (descriptions, bodies) is
+/// collapsed so it stays readable inside a one-row-per-field table; long
+/// values are truncated with an ellipsis rather than blowing out the layout.
 fn cell_str(item: &Value, key: &str) -> String {
+    let value = raw_cell(item, key);
+    let single_line = value.replace('\n', " ⏎ ");
+    if single_line.chars().count() > MAX_CELL_CHARS {
+        let truncated: String = single_line.chars().take(MAX_CELL_CHARS).collect();
+        format!("{truncated}…")
+    } else {
+        single_line
+    }
+}
+
+const MAX_CELL_CHARS: usize = 300;
+
+fn raw_cell(item: &Value, key: &str) -> String {
     // Supports dotted paths like "author.username".
     let mut cur = item;
     for part in key.split('.') {
@@ -86,5 +102,16 @@ mod tests {
         assert_eq!(cell_str(&v, "labels"), "a, b");
         assert_eq!(cell_str(&v, "n"), "3");
         assert_eq!(cell_str(&v, "missing.path"), "-");
+    }
+
+    #[test]
+    fn cell_str_collapses_multiline_and_truncates() {
+        let v = json!({"desc": "line one\nline two\nline three"});
+        assert_eq!(cell_str(&v, "desc"), "line one ⏎ line two ⏎ line three");
+        let long = "x".repeat(500);
+        let v = json!({"big": long});
+        let cell = cell_str(&v, "big");
+        assert!(cell.ends_with('…'));
+        assert!(cell.chars().count() <= MAX_CELL_CHARS + 1);
     }
 }

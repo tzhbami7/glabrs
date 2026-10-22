@@ -57,9 +57,16 @@ pub fn resolve(root: &Root, hostname_flag: Option<&str>) -> Result<Ctx, Error> {
     let ci = detect_ci();
     let hostname = match hostname_flag
         .map(normalize_host)
-        .or_else(|| std::env::var("GLABRS_HOST").ok().map(|ref h| normalize_host(h)))
-        .or_else(|| std::env::var("GITLAB_HOST").ok().map(|ref h| normalize_host(h)))
-    {
+        .or_else(|| {
+            std::env::var("GLABRS_HOST")
+                .ok()
+                .map(|ref h| normalize_host(h))
+        })
+        .or_else(|| {
+            std::env::var("GITLAB_HOST")
+                .ok()
+                .map(|ref h| normalize_host(h))
+        }) {
         Some(h) => h,
         None => match &ci {
             Some(env) => crate::api::client::host_of_api_url(&env.api_url)
@@ -75,21 +82,15 @@ pub fn resolve(root: &Root, hostname_flag: Option<&str>) -> Result<Ctx, Error> {
 
     // API URL precedence: per-host api_url > CI_API_V4_URL (in CI) > global
     // api_url > https://host[:port]/api/v4 derived from the hostname.
+    // normalize_host keeps custom ports in `hostname`, so the port must not
+    // be appended a second time (that produced host:port:port, an invalid
+    // URL, for any custom-port instance).
     let api_url = host_cfg
         .api_url
         .clone()
         .or_else(|| ci.as_ref().map(|c| c.api_url.clone()))
         .or_else(|| cfg.get_str("api_url"))
-        .unwrap_or_else(|| {
-            if let Ok(u) = url::Url::parse(&format!("https://{hostname}")) {
-                match u.port() {
-                    Some(p) => format!("https://{hostname}:{p}/api/v4"),
-                    None => format!("https://{hostname}/api/v4"),
-                }
-            } else {
-                format!("https://{hostname}/api/v4")
-            }
-        });
+        .unwrap_or_else(|| format!("https://{hostname}/api/v4"));
 
     // Token precedence: --token flag > GITLAB_TOKEN env > CI_JOB_TOKEN > stored.
     let token: Option<(String, TokenKind)> = if let Some(t) = &root.token {
@@ -283,13 +284,28 @@ mod tests {
     #[test]
     fn normalize_host_cases() {
         assert_eq!(normalize_host("GitLab.Corp.Example"), "gitlab.corp.example");
-        assert_eq!(normalize_host("https://gitlab.corp.example"), "gitlab.corp.example");
-        assert_eq!(normalize_host("http://gitlab.corp.example/"), "gitlab.corp.example");
+        assert_eq!(
+            normalize_host("https://gitlab.corp.example"),
+            "gitlab.corp.example"
+        );
+        assert_eq!(
+            normalize_host("http://gitlab.corp.example/"),
+            "gitlab.corp.example"
+        );
         // Default ports are dropped so both spellings find the same entry.
-        assert_eq!(normalize_host("gitlab.corp.example:443"), "gitlab.corp.example");
-        assert_eq!(normalize_host("gitlab.corp.example:80"), "gitlab.corp.example");
+        assert_eq!(
+            normalize_host("gitlab.corp.example:443"),
+            "gitlab.corp.example"
+        );
+        assert_eq!(
+            normalize_host("gitlab.corp.example:80"),
+            "gitlab.corp.example"
+        );
         // Custom ports are kept distinct.
-        assert_eq!(normalize_host("gitlab.corp.example:8443"), "gitlab.corp.example:8443");
+        assert_eq!(
+            normalize_host("gitlab.corp.example:8443"),
+            "gitlab.corp.example:8443"
+        );
     }
 
     #[test]
@@ -307,5 +323,23 @@ mod tests {
             web_base_from_api("https://h.example/custom", "h.example"),
             "https://h.example"
         );
+    }
+
+    #[test]
+    fn custom_port_host_derives_valid_api_url_once() {
+        // normalize_host keeps custom ports in the hostname, so the derived
+        // api_url must contain the port exactly once (the old code parsed
+        // the port back out of the hostname and appended it again, yielding
+        // host:port:port — an invalid URL).
+        let hostname = normalize_host("127.0.0.1:8931");
+        assert_eq!(hostname, "127.0.0.1:8931");
+        let api_url = format!("https://{hostname}/api/v4");
+        assert!(
+            url::Url::parse(&api_url).is_ok(),
+            "api_url {api_url} must be valid"
+        );
+        assert_eq!(api_url, "https://127.0.0.1:8931/api/v4");
+        // Default ports are still dropped from the hostname.
+        assert_eq!(normalize_host("gitlab.example:443"), "gitlab.example");
     }
 }

@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 
 use crate::cli::release_cmd::ReleaseArgs;
 use crate::cli::Root;
+use crate::cmd::helpers;
 use crate::cmd::resolve;
 use crate::error::Error;
 
@@ -29,14 +30,7 @@ pub fn run(root: &Root, args: &ReleaseArgs) -> Result<(), Error> {
     }
 }
 
-fn project_path(root: &Root) -> Result<String, Error> {
-    if let Some(r) = &root.repo {
-        return Ok(r.trim_matches('/').replace('/', "%2F"));
-    }
-    Ok(crate::git::detect_remote()?
-        .project_path
-        .replace('/', "%2F"))
-}
+use helpers::project_path;
 
 fn list(root: &Root, per_page: u32, page: Option<u32>, paginate: bool) -> Result<(), Error> {
     let pp = project_path(root)?;
@@ -343,4 +337,3 @@ mod tests {
         assert_eq!(random_boundary().len(), 32);
     }
 }
-

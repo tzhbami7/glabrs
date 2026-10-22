@@ -30,31 +30,25 @@ fn project_path(root: &Root, target: Option<&str>) -> Result<String, Error> {
     Ok(remote.project_path.replace('/', "%2F"))
 }
 
-fn encode(path: &str) -> String {
-    super::mr::encode_project_path(path)
-}
-
 fn view(root: &Root, target: Option<&str>, web: bool) -> Result<(), Error> {
     let pp = project_path(root, target)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     if web {
         // Prefer the web_url returned by the API (handles path-prefixed
         // instances correctly); fall back to the derived base.
-        let url = if let Ok(project) = ctx
-            .client()
-            .get_json_value(&format!("projects/{pp}"), &[])
-        {
-            project
-                .get("web_url")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        } else {
-            None
-        }
-        .unwrap_or_else(|| {
-            let p = pp.replace("%2F", "/");
-            format!("{}/-/project/{p}", ctx.web_url)
-        });
+        let url =
+            if let Ok(project) = ctx.client().get_json_value(&format!("projects/{pp}"), &[]) {
+                project
+                    .get("web_url")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            } else {
+                None
+            }
+            .unwrap_or_else(|| {
+                let p = pp.replace("%2F", "/");
+                format!("{}/-/project/{p}", ctx.web_url)
+            });
         open_browser(&url)?;
         return Ok(());
     }
@@ -90,12 +84,13 @@ fn list(
     ];
     let path = match group {
         Some(g) => {
-            let g_enc = encode(g);
+            let g_enc = super::mr::encode_project_path(g);
             query.push(("include_subgroups".into(), "true".into()));
             format!("groups/{g_enc}/projects")
         }
         None => "projects".into(),
-    };    if let Some(p) = page {
+    };
+    if let Some(p) = page {
         query.push(("page".into(), p.to_string()));
     }
     let items: Vec<Value> = if paginate {

@@ -133,9 +133,7 @@ fn json_body(v: &Value) -> Vec<u8> {
 }
 
 fn array_page(count: usize) -> Vec<u8> {
-    let items: Vec<Value> = (0..count)
-        .map(|i| serde_json::json!({"id": i}))
-        .collect();
+    let items: Vec<Value> = (0..count).map(|i| serde_json::json!({"id": i})).collect();
     json_body(&Value::Array(items))
 }
 
@@ -172,8 +170,11 @@ fn personal_token_uses_private_token_header() {
     let c = client_for(&base, Some(("secret", TokenKind::Personal)));
     let _ = c.get_json_value("user", &[]).unwrap();
     let req = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-    assert_eq!(req.headers.get("private-token").map(String::as_str), Some("secret"));
-    assert!(!req.headers.contains_key("job-token"));//
+    assert_eq!(
+        req.headers.get("private-token").map(String::as_str),
+        Some("secret")
+    );
+    assert!(!req.headers.contains_key("job-token"));
 }
 
 #[test]
@@ -182,7 +183,10 @@ fn job_token_uses_job_token_header() {
     let c = client_for(&base, Some(("jobtok", TokenKind::Job)));
     let _ = c.get_json_value("projects/1", &[]).unwrap();
     let req = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-    assert_eq!(req.headers.get("job-token").map(String::as_str), Some("jobtok"));
+    assert_eq!(
+        req.headers.get("job-token").map(String::as_str),
+        Some("jobtok")
+    );
     assert!(!req.headers.contains_key("private-token"));
 }
 
@@ -198,7 +202,10 @@ fn bodyless_post_sends_explicit_json_body() {
         req.headers.get("content-type").map(String::as_str),
         Some("application/json")
     );
-    assert!(!req.body.is_empty(), "bodyless POST must still carry a JSON body");
+    assert!(
+        !req.body.is_empty(),
+        "bodyless POST must still carry a JSON body"
+    );
 }
 
 #[test]
@@ -235,6 +242,36 @@ fn pagination_stops_without_headers_on_short_page() {
 }
 
 #[test]
+fn pagination_honors_caller_per_page() {
+    // A caller-supplied per_page must be used as the page size, not
+    // double-sent as a duplicate parameter (old behavior appended
+    // per_page=100 next to the caller's pair). Page 1 carries 10 items
+    // (a full per_page=10 page), page 2 is short and ends the loop.
+    let (base, rx) = spawn_server(|req| {
+        // "page=1&" matches "?page=1&per_page=..." but never the "page=1"
+        // inside "per_page=10&..." (that is followed by "0", not "&").
+        if req.path.contains("page=1&") {
+            (200, vec![], array_page(10))
+        } else {
+            (200, vec![], array_page(3))
+        }
+    });
+    let c = client_for(&base, None);
+    let items = c
+        .get_paginated(
+            "projects/1/issues",
+            &[("per_page".to_string(), "10".to_string())],
+            None,
+        )
+        .unwrap();
+    // Full first page (10) + short second page (3).
+    assert_eq!(items.len(), 13);
+    let first = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    assert!(first.path.contains("per_page=10"));
+    assert!(!first.path.contains("per_page=100"));
+}
+
+#[test]
 fn pagination_cap_ignores_runaway_server() {
     // A server that always returns a full page and claims there is a next
     // page must not hang: max_pages caps the loop.
@@ -265,7 +302,10 @@ fn url_encoding_of_query_and_path() {
     // The URL builder must encode query values (spaces, ampersands).
     let url = c.url(
         "projects/g%2Fp/issues",
-        &[("labels".into(), "a b&c".into()), ("search".into(), "x/y".into())],
+        &[
+            ("labels".into(), "a b&c".into()),
+            ("search".into(), "x/y".into()),
+        ],
     );
     assert!(url.contains("labels=a%20b%26c"));
     assert!(url.contains("search=x%2Fy"));

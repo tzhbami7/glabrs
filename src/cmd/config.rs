@@ -18,7 +18,12 @@ pub fn run(root: &Root, args: &ConfigArgs) -> Result<(), Error> {
 fn get(_root: &Root, key: Option<&str>, hostname: Option<&str>) -> Result<(), Error> {
     let cfg = Config::load()?;
     let hosts = Hosts::load()?;
-    let host = hostname.map(|h| hosts.get(&crate::cmd::normalize_host(h)).cloned().unwrap_or_default());
+    let host = hostname.map(|h| {
+        hosts
+            .get(&crate::cmd::normalize_host(h))
+            .cloned()
+            .unwrap_or_default()
+    });
 
     match key {
         Some(k) => {

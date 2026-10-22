@@ -4,7 +4,6 @@ use crate::cli::api_cmd::ApiArgs;
 use crate::cli::Root;
 use crate::cmd::resolve;
 use crate::error::Error;
-
 pub fn run(root: &Root, args: &ApiArgs) -> Result<(), Error> {
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut query: Vec<(String, String)> = Vec::new();
@@ -23,7 +22,10 @@ pub fn run(root: &Root, args: &ApiArgs) -> Result<(), Error> {
     }
     let mut path = args.path.clone();
     for (k, v) in &path_fields {
-        path = path.replace(&format!(":{k}"), &urlencode_path_field(v));
+        path = path.replace(
+            &format!(":{k}"),
+            &crate::api::client::urlencode_with(v, true),
+        );
     }
 
     let body = match &args.input {
@@ -63,18 +65,14 @@ pub fn run(root: &Root, args: &ApiArgs) -> Result<(), Error> {
     Ok(())
 }
 
-/// Path substitution values are percent-encoded except `/` and `%`, which the
-/// caller controls via an already-encoded path (mirrors glab's `-F` behavior
-/// loosely but stays safe for spaces and unicode).
-fn urlencode_path_field(v: &str) -> String {
-    let mut out = String::with_capacity(v.len());
-    for b in v.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b'%' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
+#[cfg(test)]
+mod tests {
+    use crate::api::client::urlencode_with;
+
+    #[test]
+    fn path_field_encoding() {
+        assert_eq!(urlencode_with("a b", true), "a%20b");
+        assert_eq!(urlencode_with("g/p", true), "g/p");
+        assert_eq!(urlencode_with("100%", true), "100%");
     }
-    out
 }

@@ -4,6 +4,7 @@ pub mod ci;
 pub mod completion;
 pub mod config;
 pub mod context;
+pub mod helpers;
 pub mod issue;
 pub mod mr;
 pub mod release;
@@ -47,9 +48,6 @@ impl Ctx {
     /// project-scoped endpoints only); callers needing "the current user"
     /// should degrade gracefully instead of failing the whole command.
     pub fn can_resolve_current_user(&self) -> bool {
-        !matches!(
-            self.client.token_kind(),
-            Some(TokenKind::Job)
-        )
+        !matches!(self.client.token_kind(), Some(TokenKind::Job))
     }
 }

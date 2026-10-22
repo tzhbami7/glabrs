@@ -22,6 +22,9 @@ pub enum CiArgs {
         /// Block until the pipeline reaches a terminal state
         #[arg(long)]
         wait: bool,
+        /// Give up waiting after this many seconds (with --wait)
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// View a pipeline
     View { pipeline_id: u64 },
@@ -32,6 +35,9 @@ pub enum CiArgs {
         /// Keep following until terminal state
         #[arg(long)]
         follow: bool,
+        /// Give up following after this many seconds (with --follow)
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Run a pipeline for a ref
     Run {

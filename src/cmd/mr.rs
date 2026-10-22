@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 
 use crate::cli::mr_cmd::MrArgs;
 use crate::cli::Root;
+use crate::cmd::helpers;
 use crate::cmd::resolve;
 use crate::error::Error;
 
@@ -96,20 +97,16 @@ pub fn run(root: &Root, args: &MrArgs) -> Result<(), Error> {
     }
 }
 
-fn project_path(root: &Root) -> Result<String, Error> {
-    if let Some(r) = &root.repo {
-        return Ok(encode_project_path(r));
-    }
-    Ok(crate::git::detect_remote()?
-        .project_path
-        .replace('/', "%2F"))
-}
+use helpers::project_path;
 
 /// Encode an owner/name or owner/subgroup/name path for the API (`/` -> `%2F`),
 /// accepting an already-encoded path and a full URL.
 pub fn encode_project_path(s: &str) -> String {
     let s = s.trim().trim_matches('/');
-    if let Some(rest) = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")) {
+    if let Some(rest) = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+    {
         if let Some(path) = rest.split_once('/').map(|(_, p)| p) {
             return path
                 .trim_end_matches(".git")
@@ -137,14 +134,10 @@ fn list(
     let mut query: Vec<(String, String)> = vec![("per_page".into(), per_page.to_string())];
     if let Some(a) = assignee {
         if a == "@me" {
-            // Job tokens cannot call /user; degrade to the username filter,
-            // which GitLab resolves server-side without the extra lookup.
             if ctx.can_resolve_current_user() {
-                query.push(("assignee_id".into(), my_id(&ctx)?));
+                query.push(("assignee_id".into(), helpers::my_id(&ctx)?.to_string()));
             } else {
-                return Err(Error::auth(
-                    "--assignee=@me needs a personal token (CI job tokens cannot call /user)",
-                ));
+                return Err(helpers::at_me_needs_personal_token("--assignee"));
             }
         } else {
             query.push((
@@ -156,11 +149,9 @@ fn list(
     if let Some(r) = reviewer {
         if r == "@me" {
             if ctx.can_resolve_current_user() {
-                query.push(("reviewer_id".into(), my_id(&ctx)?));
+                query.push(("reviewer_id".into(), helpers::my_id(&ctx)?.to_string()));
             } else {
-                return Err(Error::auth(
-                    "--reviewer=@me needs a personal token (CI job tokens cannot call /user)",
-                ));
+                return Err(helpers::at_me_needs_personal_token("--reviewer"));
             }
         } else {
             query.push((
@@ -172,11 +163,9 @@ fn list(
     if let Some(a) = author {
         if a == "@me" {
             if ctx.can_resolve_current_user() {
-                query.push(("author_id".into(), my_id(&ctx)?));
+                query.push(("author_id".into(), helpers::my_id(&ctx)?.to_string()));
             } else {
-                return Err(Error::auth(
-                    "--author=@me needs a personal token (CI job tokens cannot call /user)",
-                ));
+                return Err(helpers::at_me_needs_personal_token("--author"));
             }
         } else {
             query.push((
@@ -289,28 +278,24 @@ fn create(
     });
     if let Some(a) = assignee {
         if a != "@me" {
-            body["assignee_ids"] = json!([user_id(&ctx, a)?]);
+            body["assignee_ids"] = json!([helpers::user_id(&ctx, a)?]);
         } else if ctx.can_resolve_current_user() {
-            body["assignee_ids"] = json!([my_id_num(&ctx)?]);
+            body["assignee_ids"] = json!([helpers::my_id(&ctx)?]);
         } else {
-            return Err(Error::auth(
-                "--assignee=@me needs a personal token (CI job tokens cannot call /user)",
-            ));
+            return Err(helpers::at_me_needs_personal_token("--assignee"));
         }
     }
     if let Some(r) = reviewer {
         if r != "@me" {
-            body["reviewer_ids"] = json!([user_id(&ctx, r)?]);
+            body["reviewer_ids"] = json!([helpers::user_id(&ctx, r)?]);
         } else if ctx.can_resolve_current_user() {
-            body["reviewer_ids"] = json!([my_id_num(&ctx)?]);
+            body["reviewer_ids"] = json!([helpers::my_id(&ctx)?]);
         } else {
-            return Err(Error::auth(
-                "--reviewer=@me needs a personal token (CI job tokens cannot call /user)",
-            ));
+            return Err(helpers::at_me_needs_personal_token("--reviewer"));
         }
     }
     if let Some(m) = milestone {
-        let mid = milestone_id(&ctx, &pp, m)?;
+        let mid = helpers::milestone_id(&ctx, &pp, m)?;
         body["milestone_id"] = json!(mid);
     }
     if let Some(l) = labels {
@@ -331,7 +316,6 @@ fn create(
         &[],
         Some(body),
     )?;
-    let iid = mr.get("iid").and_then(|v| v.as_u64()).unwrap_or(0);
     if web {
         let web_url = mr.get("web_url").and_then(|v| v.as_str()).unwrap_or("");
         if !web_url.is_empty() {
@@ -340,7 +324,6 @@ fn create(
         }
     }
     crate::render::table::render_one(&mr, &["iid", "title", "web_url"], ctx.json)?;
-    let _ = iid;
     Ok(())
 }
 
@@ -381,8 +364,6 @@ fn diff(root: &Root, iid: u64) -> Result<(), Error> {
     let changes: Value = ctx
         .client()
         .get_json_value(&format!("projects/{pp}/merge_requests/{iid}/changes"), &[])?;
-    let mr = changes.get("merge_request").cloned().unwrap_or(Value::Null);
-    let _ = mr;
     let diffs = changes
         .pointer("/changes")
         .and_then(|v| v.as_array())
@@ -532,28 +513,27 @@ fn update(
     }
     if let Some(a) = assignee {
         if a != "@me" {
-            body.insert("assignee_ids".into(), json!([user_id(&ctx, a)?]));
+            body.insert("assignee_ids".into(), json!([helpers::user_id(&ctx, a)?]));
         } else if ctx.can_resolve_current_user() {
-            body.insert("assignee_ids".into(), json!([my_id_num(&ctx)?]));
+            body.insert("assignee_ids".into(), json!([helpers::my_id(&ctx)?]));
         } else {
-            return Err(Error::auth(
-                "--assignee=@me needs a personal token (CI job tokens cannot call /user)",
-            ));
+            return Err(helpers::at_me_needs_personal_token("--assignee"));
         }
     }
     if let Some(r) = reviewer {
         if r != "@me" {
-            body.insert("reviewer_ids".into(), json!([user_id(&ctx, r)?]));
+            body.insert("reviewer_ids".into(), json!([helpers::user_id(&ctx, r)?]));
         } else if ctx.can_resolve_current_user() {
-            body.insert("reviewer_ids".into(), json!([my_id_num(&ctx)?]));
+            body.insert("reviewer_ids".into(), json!([helpers::my_id(&ctx)?]));
         } else {
-            return Err(Error::auth(
-                "--reviewer=@me needs a personal token (CI job tokens cannot call /user)",
-            ));
+            return Err(helpers::at_me_needs_personal_token("--reviewer"));
         }
     }
     if let Some(m) = milestone {
-        body.insert("milestone_id".into(), json!(milestone_id(&ctx, &pp, m)?));
+        body.insert(
+            "milestone_id".into(),
+            json!(helpers::milestone_id(&ctx, &pp, m)?),
+        );
     }
     if let Some(l) = labels {
         body.insert("labels".into(), json!(l));
@@ -594,11 +574,15 @@ fn fallback_title(source: &str, target: &str) -> String {
 
 /// Strip the draft/WIP prefix the way GitLab itself recognizes it
 /// (`Draft:`, `WIP:`, `[Draft]`, `(WIP)` — case-insensitive, any casing of
-/// the label).
+/// the label). Slicing goes through `str::get` so multi-byte titles
+/// (e.g. CJK) never panic on a non-char-boundary index.
 fn strip_draft_prefix(title: &str) -> String {
     let patterns = ["draft:", "wip:", "[draft]", "(wip)"];
     for p in patterns {
-        if title.len() >= p.len() && title[..p.len()].eq_ignore_ascii_case(p) {
+        if title
+            .get(..p.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(p))
+        {
             return title[p.len()..].trim_start().to_string();
         }
     }
@@ -610,13 +594,9 @@ fn fill_from_commits(source: &str, target: &str) -> Result<(String, String), Err
     // range (fresh clones of new branches may not have origin/<source> yet).
     let remote_range = format!("origin/{target}..origin/{source}");
     let local_range = format!("{target}..{source}");
-    let log = crate::git::run_git(&[
-        "log",
-        "--pretty=format:%s%n%b",
-        &remote_range,
-    ])
-    .or_else(|_| crate::git::run_git(&["log", "--pretty=format:%s%n%b", &local_range]))
-    .unwrap_or_default();
+    let log = crate::git::run_git(&["log", "--pretty=format:%s%n%b", &remote_range])
+        .or_else(|_| crate::git::run_git(&["log", "--pretty=format:%s%n%b", &local_range]))
+        .unwrap_or_default();
     let mut lines = log.lines();
     let title = lines.next().unwrap_or("Update branch").to_string();
     let body: String = lines.collect::<Vec<_>>().join("\n").trim().to_string();
@@ -634,48 +614,6 @@ fn default_branch(ctx: &crate::cmd::Ctx, pp: &str) -> Result<String, Error> {
         .to_string())
 }
 
-fn my_id(ctx: &crate::cmd::Ctx) -> Result<String, Error> {
-    let user: Value = ctx.client().get_json_value("user", &[])?;
-    user.get("id")
-        .and_then(|v| v.as_u64())
-        .map(|i| i.to_string())
-        .ok_or_else(|| Error::runtime("cannot resolve current user id"))
-}
-
-fn my_id_num(ctx: &crate::cmd::Ctx) -> Result<u64, Error> {
-    let user: Value = ctx.client().get_json_value("user", &[])?;
-    user.get("id")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| Error::runtime("cannot resolve current user id"))
-}
-
-fn user_id(ctx: &crate::cmd::Ctx, username: &str) -> Result<u64, Error> {
-    let username = username.trim_start_matches('@');
-    let users: Value = ctx
-        .client()
-        .get_json_value("users", &[("username".into(), username.to_string())])?;
-    users
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|u| u.get("id").and_then(|v| v.as_u64()))
-        .ok_or_else(|| Error::not_found(format!("user @{username} not found")))
-}
-
-fn milestone_id(ctx: &crate::cmd::Ctx, pp: &str, title: &str) -> Result<u64, Error> {
-    let milestones: Vec<Value> =
-        ctx.client()
-            .get_paginated(&format!("projects/{pp}/milestones"), &[], None)?;
-    for m in milestones {
-        if m.get("title").and_then(|v| v.as_str()) == Some(title) {
-            return m
-                .get("id")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| Error::runtime("milestone missing id"));
-        }
-    }
-    Err(Error::not_found(format!("milestone {title:?} not found")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,7 +621,10 @@ mod tests {
     #[test]
     fn encode_project_path_variants() {
         assert_eq!(encode_project_path("group/proj"), "group%2Fproj");
-        assert_eq!(encode_project_path("/group/sub/proj/"), "group%2Fsub%2Fproj");
+        assert_eq!(
+            encode_project_path("/group/sub/proj/"),
+            "group%2Fsub%2Fproj"
+        );
         assert_eq!(encode_project_path("group%2Fproj"), "group%2Fproj");
         assert_eq!(
             encode_project_path("https://gitlab.com/group/sub/proj.git"),
@@ -701,6 +642,10 @@ mod tests {
         assert_eq!(strip_draft_prefix("(wip) Fix bug"), "Fix bug");
         assert_eq!(strip_draft_prefix("Fix draft: bug"), "Fix draft: bug");
         assert_eq!(strip_draft_prefix("Fix bug"), "Fix bug");
+        // Multi-byte titles must not panic on a mid-codepoint byte index.
+        assert_eq!(strip_draft_prefix("日本語abc"), "日本語abc");
+        assert_eq!(strip_draft_prefix("日本語WIP: tail"), "日本語WIP: tail");
+        assert_eq!(strip_draft_prefix("Ünïcödé: ümlaut"), "Ünïcödé: ümlaut");
+        assert_eq!(strip_draft_prefix("WIP: 日本語 tail"), "日本語 tail");
     }
 }
-

@@ -64,23 +64,38 @@ impl Client {
     /// GET a paginated list, following `X-Next-Page` until exhausted or
     /// `max_pages` is reached (default 10,000 pages).
     ///
-    /// Stops on the `X-Next-Page` header when the server sends one; falls back
-    /// to "short page means last" for endpoints that omit pagination headers.
-    /// The hard cap guarantees termination even against a server that ignores
-    /// the `page` parameter.
+    /// A `per_page` pair in `query` (e.g. from `--per-page`) is honored as the
+    /// page size and not double-sent as a duplicate parameter. Stops on the
+    /// `X-Next-Page` header when the server sends one; falls back to "short
+    /// page means last" for endpoints that omit pagination headers. The hard
+    /// cap guarantees termination even against a server that ignores the
+    /// `page` parameter.
     pub fn get_paginated(
         &self,
         path: &str,
         query: &[(String, String)],
         max_pages: Option<u32>,
     ) -> Result<Vec<Value>, Error> {
+        // Extract the caller's page size instead of appending a duplicate
+        // per_page parameter next to it (GitLab rejects duplicates).
+        let per_page = query
+            .iter()
+            .find(|(k, _)| k == "per_page")
+            .and_then(|(_, v)| v.trim().parse::<u32>().ok())
+            .filter(|n| (1..=100).contains(n))
+            .unwrap_or(100);
+        let query: Vec<(String, String)> = query
+            .iter()
+            .filter(|(k, _)| k != "per_page")
+            .cloned()
+            .collect();
         let mut all = Vec::new();
         let cap = max_pages.unwrap_or(MAX_PAGES_DEFAULT);
         let mut page: u32 = 1;
         loop {
             let mut q = query.to_vec();
             q.push(("page".into(), page.to_string()));
-            q.push(("per_page".into(), "100".into()));
+            q.push(("per_page".into(), per_page.to_string()));
             let url = self.url(path, &q);
             self.verbose_log("GET", path);
             let resp = self.apply_auth(self.agent.get(&url)).call()?;
@@ -93,7 +108,11 @@ impl Client {
                 other => {
                     return Err(Error::runtime(format!(
                         "expected a JSON array from {path}, got {}",
-                        if other.is_object() { "object" } else { "scalar" }
+                        if other.is_object() {
+                            "object"
+                        } else {
+                            "scalar"
+                        }
                     )))
                 }
             };
@@ -106,7 +125,7 @@ impl Client {
                 Some(_) => break,
                 // No header: fall back to short-page detection, capped.
                 None => {
-                    if count < 100 || page >= cap {
+                    if count < per_page as usize || page >= cap {
                         break;
                     }
                     page += 1;
@@ -251,17 +270,26 @@ pub fn host_of_api_url(api_url: &str) -> Option<String> {
     u.host_str().map(|s| s.to_ascii_lowercase())
 }
 
-fn urlencode(s: &str) -> String {
+/// Percent-encode a string. `allow_path` additionally keeps `/` and `%`
+/// unescaped, for path segments the caller controls via an already-encoded
+/// path (mirrors glab's `-F` behavior loosely but stays safe for spaces and
+/// unicode). Query strings and query values use the strict form.
+pub fn urlencode_with(s: &str, allow_path: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char)
             }
+            b'/' | b'%' if allow_path => out.push(b as char),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
     out
+}
+
+pub fn urlencode(s: &str) -> String {
+    urlencode_with(s, false)
 }
 
 #[cfg(test)]
@@ -289,6 +317,14 @@ mod tests {
         let url = c.url("projects/x%2Fy/issues", &[("labels".into(), "a,b".into())]);
         assert!(url.contains("labels=a%2Cb"));
         assert!(url.starts_with("https://gitlab.example/api/v4/projects/x%2Fy/issues?"));
+    }
+
+    #[test]
+    fn urlencode_path_keeps_slashes_and_percent() {
+        // Path-substitution form keeps / and % (caller-controlled encoding);
+        // query form escapes them.
+        assert_eq!(urlencode_with("a b/c%d", true), "a%20b/c%d");
+        assert_eq!(urlencode_with("a b/c%d", false), "a%20b%2Fc%25d");
     }
 
     #[test]

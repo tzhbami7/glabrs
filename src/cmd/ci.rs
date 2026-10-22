@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 
 use crate::cli::ci_cmd::CiArgs;
 use crate::cli::Root;
+use crate::cmd::helpers;
 use crate::cmd::resolve;
 use crate::error::Error;
 
@@ -14,9 +15,17 @@ pub fn run(root: &Root, args: &CiArgs) -> Result<(), Error> {
             page,
             paginate,
         } => list(root, ref_, status, *per_page, *page, *paginate),
-        CiArgs::Status { ref_, wait } => status(root, ref_, *wait),
+        CiArgs::Status {
+            ref_,
+            wait,
+            timeout,
+        } => status(root, ref_, *wait, *timeout),
         CiArgs::View { pipeline_id } => view(root, *pipeline_id),
-        CiArgs::Trace { target, follow } => trace(root, target, *follow),
+        CiArgs::Trace {
+            target,
+            follow,
+            timeout,
+        } => trace(root, target, *follow, *timeout),
         CiArgs::Run { ref_, variables } => run_pipeline(root, ref_, variables),
         CiArgs::Retry { pipeline_id } => retry(root, *pipeline_id),
         CiArgs::Cancel { pipeline_id } => cancel(root, *pipeline_id),
@@ -24,14 +33,7 @@ pub fn run(root: &Root, args: &CiArgs) -> Result<(), Error> {
     }
 }
 
-fn project_path(root: &Root) -> Result<String, Error> {
-    if let Some(r) = &root.repo {
-        return Ok(r.trim_matches('/').replace('/', "%2F"));
-    }
-    Ok(crate::git::detect_remote()?
-        .project_path
-        .replace('/', "%2F"))
-}
+use helpers::project_path;
 
 fn list(
     root: &Root,
@@ -68,7 +70,12 @@ fn list(
     Ok(())
 }
 
-fn status(root: &Root, ref_: &Option<String>, wait: bool) -> Result<(), Error> {
+fn status(
+    root: &Root,
+    ref_: &Option<String>,
+    wait: bool,
+    timeout: Option<u64>,
+) -> Result<(), Error> {
     let pp = project_path(root)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut query: Vec<(String, String)> = Vec::new();
@@ -83,6 +90,7 @@ fn status(root: &Root, ref_: &Option<String>, wait: bool) -> Result<(), Error> {
         .ok_or_else(|| Error::not_found("no pipelines found"))?;
 
     let poll_interval = std::time::Duration::from_secs(3);
+    let deadline = timeout.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
     loop {
         let st = pipeline
             .get("status")
@@ -96,6 +104,11 @@ fn status(root: &Root, ref_: &Option<String>, wait: bool) -> Result<(), Error> {
                 println!("pipeline #{}: {}", id, st);
             }
             return pipeline_exit(st);
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return Err(Error::runtime(format!(
+                "timed out waiting for pipeline (status: {st}); use a larger --timeout or poll without --wait"
+            )));
         }
         std::thread::sleep(poll_interval);
         let id = pipeline.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -119,12 +132,13 @@ fn view(root: &Root, pipeline_id: u64) -> Result<(), Error> {
     Ok(())
 }
 
-fn trace(root: &Root, target: &str, follow: bool) -> Result<(), Error> {
+fn trace(root: &Root, target: &str, follow: bool, timeout: Option<u64>) -> Result<(), Error> {
     let pp = project_path(root)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let job = find_job(&ctx, &pp, target)?;
     let job_id = job.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
     let mut printed = 0usize;
+    let deadline = timeout.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
     loop {
         // Fetch the raw trace.
         let url = format!("projects/{pp}/jobs/{job_id}/trace");
@@ -148,6 +162,11 @@ fn trace(root: &Root, target: &str, follow: bool) -> Result<(), Error> {
             }
             return job_exit(st);
         }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return Err(Error::runtime(format!(
+                "timed out following job #{job_id} (status: {st}); use a larger --timeout or run without --follow"
+            )));
+        }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
 }
@@ -167,15 +186,17 @@ fn find_job(ctx: &crate::cmd::Ctx, pp: &str, target: &str) -> Result<Value, Erro
             .client()
             .get_json_value(&format!("projects/{pp}/jobs/{id}"), &[]);
     }
-    // Look up by name in the latest pipeline for the default branch. Fetching
-    // every job of the project and returning the first name match would pick
-    // an arbitrary old pipeline's job on any active project.
-    let pipelines: Vec<Value> = ctx
-        .client()
-        .get_json_vec(
-            &format!("projects/{pp}/pipelines"),
-            &[("per_page".into(), "1".into()), ("order_by".into(), "id".into()), ("sort".into(), "desc".into())],
-        )?;
+    // Look up by name in the most recently created pipeline (any branch).
+    // Fetching every job of the project and returning the first name match
+    // would pick an arbitrary old pipeline's job on any active project.
+    let pipelines: Vec<Value> = ctx.client().get_json_vec(
+        &format!("projects/{pp}/pipelines"),
+        &[
+            ("per_page".into(), "1".into()),
+            ("order_by".into(), "id".into()),
+            ("sort".into(), "desc".into()),
+        ],
+    )?;
     let pipeline_id = pipelines
         .first()
         .and_then(|p| p.get("id").and_then(|v| v.as_u64()))

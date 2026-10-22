@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -93,13 +95,70 @@ impl Hosts {
     }
 }
 
-/// Write a file readable only by the owner.
+/// Write a file readable only by the owner, atomically: the content lands in
+/// a temp file created 0600 and is renamed over the target, so a crash can
+/// never leave the secret world-readable (fs::write + chmod has a window
+/// where the file is 0644).
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    fs::write(path, bytes)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = tempfile_in(dir)?;
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .map_err(|e| Error::runtime(format!("{}: {e}", tmp.display())))?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Create an unused temp path in `dir` (random hex name, retry on collision).
+fn tempfile_in(dir: &Path) -> Result<PathBuf, Error> {
+    for _ in 0..16 {
+        let mut name = String::from(".glabrs-tmp-");
+        let mut buf = [0u8; 8];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut buf))
+            .map_err(|e| Error::runtime(format!("read /dev/urandom: {e}")))?;
+        name.push_str(&buf.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(Error::runtime("could not create a temp file name"))
 }
 
 fn restrict_dir_perms(dir: &Path) {
     let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_private_sets_0600_and_writes_content() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("hosts.toml");
+        write_private(&target, b"token = \"x\"").expect("write");
+        let mode = fs::metadata(&target).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "token = \"x\"");
+        // No temp files left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".glabrs-tmp-"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
 }

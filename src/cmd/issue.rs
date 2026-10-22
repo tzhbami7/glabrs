@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 
 use crate::cli::issue_cmd::IssueArgs;
 use crate::cli::Root;
-use crate::cmd::mr::encode_project_path;
+use crate::cmd::helpers;
 use crate::cmd::resolve;
 use crate::error::Error;
 
@@ -48,14 +48,7 @@ pub fn run(root: &Root, args: &IssueArgs) -> Result<(), Error> {
 }
 
 /// Resolve project path: --repo/-R > git remote.
-fn project_path(root: &Root) -> Result<String, Error> {
-    if let Some(r) = &root.repo {
-        return Ok(encode_project_path(r));
-    }
-    Ok(crate::git::detect_remote()?
-        .project_path
-        .replace('/', "%2F"))
-}
+use helpers::project_path;
 
 #[allow(clippy::too_many_arguments)]
 fn list(
@@ -72,16 +65,32 @@ fn list(
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut query: Vec<(String, String)> = vec![("per_page".into(), per_page.to_string())];
     if let Some(a) = assignee {
-        query.push((
-            "assignee_username".into(),
-            a.trim_start_matches('@').to_string(),
-        ));
+        if a == "@me" {
+            if ctx.can_resolve_current_user() {
+                query.push(("assignee_id".into(), helpers::my_id(&ctx)?.to_string()));
+            } else {
+                return Err(helpers::at_me_needs_personal_token("--assignee"));
+            }
+        } else {
+            query.push((
+                "assignee_username".into(),
+                a.trim_start_matches('@').to_string(),
+            ));
+        }
     }
     if let Some(a) = author {
-        query.push((
-            "author_username".into(),
-            a.trim_start_matches('@').to_string(),
-        ));
+        if a == "@me" {
+            if ctx.can_resolve_current_user() {
+                query.push(("author_id".into(), helpers::my_id(&ctx)?.to_string()));
+            } else {
+                return Err(helpers::at_me_needs_personal_token("--author"));
+            }
+        } else {
+            query.push((
+                "author_username".into(),
+                a.trim_start_matches('@').to_string(),
+            ));
+        }
     }
     if let Some(l) = labels {
         query.push(("labels".into(), l.clone()));
@@ -136,20 +145,18 @@ fn create(
         body["labels"] = Value::String(l.clone());
     }
     if let Some(m) = milestone {
-        let mid = milestone_id(&ctx, &pp, m)?;
+        let mid = helpers::milestone_id(&ctx, &pp, m)?;
         body["milestone_id"] = Value::Number(mid.into());
     }
     if let Some(a) = assignee {
         let uid = if a == "@me" {
             if ctx.can_resolve_current_user() {
-                my_id_num(&ctx)?
+                helpers::my_id(&ctx)?
             } else {
-                return Err(Error::auth(
-                    "--assignee=@me needs a personal token (CI job tokens cannot call /user)",
-                ));
+                return Err(helpers::at_me_needs_personal_token("--assignee"));
             }
         } else {
-            user_id(&ctx, a)?
+            helpers::user_id(&ctx, a)?
         };
         body["assignee_ids"] = Value::Array(vec![Value::Number(uid.into())]);
     }
@@ -252,42 +259,4 @@ fn delete(root: &Root, iid: u64, yes: bool) -> Result<(), Error> {
         println!("Deleted issue #{iid}");
     }
     Ok(())
-}
-
-/// Look up a milestone ID by title (e.g. "v2.1").
-fn milestone_id(ctx: &crate::cmd::Ctx, pp: &str, title: &str) -> Result<u64, Error> {
-    let milestones: Vec<Value> =
-        ctx.client()
-            .get_paginated(&format!("projects/{pp}/milestones"), &[], None)?;
-    for m in milestones {
-        if m.get("title").and_then(|v| v.as_str()) == Some(title) {
-            return m
-                .get("id")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| Error::runtime("milestone missing id"));
-        }
-    }
-    Err(Error::not_found(format!("milestone {title:?} not found")))
-}
-
-/// Look up a user ID by username (with or without @, or `@me`).
-fn user_id(ctx: &crate::cmd::Ctx, username: &str) -> Result<u64, Error> {
-    if username == "@me" {
-        return my_id_num(ctx);
-    }
-    let username = username.trim_start_matches('@');
-    let users: Vec<Value> = ctx
-        .client()
-        .get_json_vec("users", &[("username".into(), username.to_string())])?;
-    users
-        .first()
-        .and_then(|u| u.get("id").and_then(|v| v.as_u64()))
-        .ok_or_else(|| Error::not_found(format!("user @{username} not found")))
-}
-
-fn my_id_num(ctx: &crate::cmd::Ctx) -> Result<u64, Error> {
-    let user: Value = ctx.client().get_json_value("user", &[])?;
-    user.get("id")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| Error::runtime("cannot resolve current user id"))
 }
