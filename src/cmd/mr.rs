@@ -195,6 +195,10 @@ fn list(
     }
     if let Some(s) = state {
         query.push(("state".into(), s.clone()));
+    } else {
+        // Like glab, list opened MRs by default; GitLab's API itself defaults
+        // to `all`, which silently changed what a bare `mr list` means.
+        query.push(("state".into(), "opened".into()));
     }
     // Pushed unconditionally: honored as the start page under --paginate
     // (get_paginated dedups it) and as the single page otherwise.

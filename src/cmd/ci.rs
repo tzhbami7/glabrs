@@ -484,12 +484,12 @@ fn is_terminal_state(st: &str) -> bool {
 fn pipeline_exit(st: &str) -> Result<(), Error> {
     // Exhaustive on the documented status set; anything unknown fails so a
     // new GitLab status string cannot mask a still-running pipeline as
-    // success in scripts.
+    // success in scripts. `skipped` is a success like in glab: a pipeline
+    // that was skipped by rules did not fail.
     match st {
-        "success" => Ok(()),
+        "success" | "skipped" => Ok(()),
         "failed" => Err(Error::runtime("pipeline failed")),
         "canceled" => Err(Error::runtime("pipeline canceled")),
-        "skipped" => Err(Error::runtime("pipeline skipped")),
         other => Err(Error::runtime(format!(
             "pipeline not finished (status: {other})"
         ))),
@@ -497,11 +497,11 @@ fn pipeline_exit(st: &str) -> Result<(), Error> {
 }
 
 fn job_exit(st: &str) -> Result<(), Error> {
+    // Same contract as [`pipeline_exit`], including skipped-as-success.
     match st {
-        "success" => Ok(()),
+        "success" | "skipped" => Ok(()),
         "failed" => Err(Error::runtime("job failed")),
         "canceled" => Err(Error::runtime("job canceled")),
-        "skipped" => Err(Error::runtime("job skipped")),
         other => Err(Error::runtime(format!(
             "job not finished (status: {other})"
         ))),
@@ -515,9 +515,10 @@ mod tests {
     #[test]
     fn pipeline_exit_codes() {
         assert!(pipeline_exit("success").is_ok());
+        // Like glab: rules skipped the pipeline, it did not fail.
+        assert!(pipeline_exit("skipped").is_ok());
         assert!(pipeline_exit("failed").is_err());
         assert!(pipeline_exit("canceled").is_err());
-        assert!(pipeline_exit("skipped").is_err());
         // Unknown/running statuses must not read as success.
         assert!(pipeline_exit("running").is_err());
         assert!(pipeline_exit("pending").is_err());
@@ -527,6 +528,7 @@ mod tests {
     #[test]
     fn job_exit_codes() {
         assert!(job_exit("success").is_ok());
+        assert!(job_exit("skipped").is_ok()); // same contract as pipelines
         assert!(job_exit("failed").is_err());
         assert!(job_exit("running").is_err());
     }

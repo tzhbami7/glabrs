@@ -18,7 +18,7 @@ pub enum MrArgs {
         /// Filter by author (`@me`, `@username`)
         #[arg(long)]
         author: Option<String>,
-        /// Filter by state (opened, closed, merged)
+        /// Filter by state (opened, closed, merged, all; default: opened)
         #[arg(long)]
         state: Option<String>,
         #[command(flatten)]
