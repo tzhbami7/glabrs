@@ -35,6 +35,9 @@ url = "2"
 tempfile = "3"
 ureq = { version = "2", features = ["json", "tls"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dependencies.thiserror]
 version = "2"
 
