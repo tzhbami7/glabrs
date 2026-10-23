@@ -21,7 +21,8 @@ pub fn run(root: &Root, args: &RepoArgs) -> Result<(), Error> {
     }
 }
 
-/// Resolve project target: explicit > --repo/-R > git remote.
+/// Resolve project target: explicit > --repo/-R > git remote (checked
+/// against the resolved target host like every other group).
 fn project_path(root: &Root, target: Option<&str>) -> Result<String, Error> {
     if let Some(t) = target {
         return super::mr::encode_project_path(t);
@@ -30,6 +31,13 @@ fn project_path(root: &Root, target: Option<&str>) -> Result<String, Error> {
         return super::mr::encode_project_path(r);
     }
     let remote = crate::git::detect_remote()?;
+    let host = crate::cmd::target_hostname(root)?;
+    if remote.hostname != host {
+        return Err(Error::usage(format!(
+            "this checkout's origin is {} but the target instance is {host}; pass -R <project> or --hostname",
+            remote.hostname
+        )));
+    }
     Ok(remote.project_path.replace('/', "%2F"))
 }
 

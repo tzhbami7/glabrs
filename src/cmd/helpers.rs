@@ -9,17 +9,29 @@ use crate::error::Error;
 /// spellings: numeric ID, `owner/name`, `group/sub/name`, full URL, and an
 /// already-encoded path (`group%2Fname`).
 ///
+/// When the default would come from the git remote but the remote's host is
+/// not the instance the command targets (see [`crate::cmd::target_hostname`],
+/// which may fall back to a single configured host), the remote's path is
+/// refused with a clear `-R` hint instead of querying the wrong instance.
+///
 /// # Errors
 ///
-/// Returns [`Error::Usage`] for a bare URL with no project path and
+/// Returns [`Error::Usage`] for a bare URL with no project path, the `-R`
+/// hint when the checkout's origin does not live on the target instance, and
 /// [`Error`] when git remote detection fails.
 pub fn project_path(root: &crate::cli::Root) -> Result<String, Error> {
     if let Some(r) = &root.repo {
         return crate::cmd::mr::encode_project_path(r);
     }
-    Ok(crate::git::detect_remote()?
-        .project_path
-        .replace('/', "%2F"))
+    let remote = crate::git::detect_remote()?;
+    let target = crate::cmd::target_hostname(root)?;
+    if remote.hostname != target {
+        return Err(Error::usage(format!(
+            "this checkout's origin is {} but the target instance is {target}; pass -R <project> or --hostname",
+            remote.hostname
+        )));
+    }
+    Ok(remote.project_path.replace('/', "%2F"))
 }
 
 /// The current user's numeric id via `GET /user`.

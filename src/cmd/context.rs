@@ -55,6 +55,64 @@ pub fn normalize_host(h: &str) -> String {
     s
 }
 
+/// Decide which host a command targets when it was detected from the git
+/// remote: the detected host itself when it is configured or a token was
+/// passed explicitly (the error for an unconfigured host then names the host
+/// the user is actually working on); otherwise the single configured host, so
+/// checkouts of non-GitLab remotes (github.com & co) still work against the
+/// one instance this installation manages. With zero or several configured
+/// hosts the detected host wins — guessing among many would silently target
+/// the wrong instance, and zero configured hosts is the honest error.
+///
+/// Pure so the fallback ladder is testable without git or the filesystem.
+#[must_use]
+pub fn resolve_detected_host(
+    detected: &str,
+    hosts: &config::hosts::Hosts,
+    explicit_token: bool,
+) -> String {
+    if explicit_token || hosts.get(detected).is_some() {
+        detected.to_string()
+    } else {
+        let names = hosts.names();
+        match names.as_slice() {
+            [only] => only.clone(),
+            _ => detected.to_string(),
+        }
+    }
+}
+
+/// The host a command should target, for reuse outside [`resolve`].
+///
+/// Same ladder as [`resolve`]: `--hostname` > `GLABRS_HOST` > `GITLAB_HOST` >
+/// `CI_API_V4_URL` host > git remote (with the single-configured-host
+/// fallback when the remote's host is unconfigured). Loads hosts.toml.
+///
+/// # Errors
+///
+/// Returns [`Error`] when hosts.toml cannot be loaded or git detection fails.
+pub fn target_hostname(root: &Root) -> Result<String, Error> {
+    if let Some(h) = root.hostname.as_deref() {
+        return Ok(normalize_host(h));
+    }
+    for var in ["GLABRS_HOST", "GITLAB_HOST"] {
+        if let Ok(h) = std::env::var(var) {
+            return Ok(normalize_host(&h));
+        }
+    }
+    if let Ok(api_url) = std::env::var("CI_API_V4_URL") {
+        if let Some(host) = crate::api::client::host_of_api_url(&api_url) {
+            return Ok(host);
+        }
+    }
+    let hosts = config::hosts::Hosts::load()?;
+    Ok(resolve_detected_host(
+        &crate::git::detect_remote()?.hostname,
+        &hosts,
+        token_flag(root.token.as_ref()).is_some(),
+    ))
+}
+
 /// Resolve the target host, merge settings per precedence, and build the client.
 ///
 /// Precedence: flags > env (`GLABRS_HOST` / `GITLAB_HOST` / `GITLAB_TOKEN` / CI) >
@@ -94,7 +152,11 @@ pub fn resolve(root: &Root, hostname_flag: Option<&str>) -> Result<Ctx, Error> {
         None => match &ci {
             Some(env) => crate::api::client::host_of_api_url(&env.api_url)
                 .unwrap_or_else(|| "localhost".to_string()),
-            None => crate::git::detect_remote()?.hostname,
+            None => resolve_detected_host(
+                &crate::git::detect_remote()?.hostname,
+                &hosts,
+                token_flag(root.token.as_ref()).is_some(),
+            ),
         },
     };
 
@@ -405,5 +467,65 @@ mod tests {
         assert_eq!(token_flag(Some(&String::new())), None);
         assert_eq!(token_flag(Some(&"   ".into())), None);
         assert_eq!(token_flag(None), None);
+    }
+
+    fn hosts_with(entries: &[&str]) -> config::hosts::Hosts {
+        use std::fmt::Write as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hosts.toml");
+        let mut text = String::new();
+        for name in entries {
+            // Writing into the existing String avoids a per-entry allocation;
+            // `write!` to a String cannot fail.
+            let _ = write!(text, "[\"{name}\"]\ntoken = \"t\"\n");
+        }
+        std::fs::write(&path, text).expect("write");
+        config::hosts::Hosts::load_from(&path).expect("load")
+    }
+
+    #[test]
+    fn detected_host_wins_when_configured() {
+        let hosts = hosts_with(&["gitlab.corp.example"]);
+        assert_eq!(
+            resolve_detected_host("gitlab.corp.example", &hosts, false),
+            "gitlab.corp.example"
+        );
+    }
+
+    #[test]
+    fn unconfigured_remote_falls_back_to_single_configured_host() {
+        // A github.com checkout inside an installation that only manages one
+        // self-hosted instance still targets that instance.
+        let hosts = hosts_with(&["gitlab.corp.example"]);
+        assert_eq!(
+            resolve_detected_host("github.com", &hosts, false),
+            "gitlab.corp.example"
+        );
+    }
+
+    #[test]
+    fn explicit_token_pins_the_detected_host() {
+        // --token/GITLAB_TOKEN means the user pointed at this host on purpose;
+        // errors must name it, not silently reroute to another instance.
+        let hosts = hosts_with(&["gitlab.corp.example"]);
+        assert_eq!(
+            resolve_detected_host("github.com", &hosts, true),
+            "github.com"
+        );
+    }
+
+    #[test]
+    fn zero_or_multiple_configured_hosts_keep_the_detected_host() {
+        let none = hosts_with(&[]);
+        assert_eq!(
+            resolve_detected_host("github.com", &none, false),
+            "github.com"
+        );
+
+        let many = hosts_with(&["a.example", "b.example"]);
+        assert_eq!(
+            resolve_detected_host("github.com", &many, false),
+            "github.com"
+        );
     }
 }

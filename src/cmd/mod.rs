@@ -36,7 +36,7 @@ use crate::api::client::TokenKind;
 use crate::cli::{Command, Root};
 use crate::error::Error;
 
-pub use context::{build_agent, normalize_host, resolve, warn_insecure};
+pub use context::{build_agent, normalize_host, resolve, target_hostname, warn_insecure};
 
 /// Route the parsed command tree to its command group's `run`.
 ///
