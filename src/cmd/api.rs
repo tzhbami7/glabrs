@@ -4,13 +4,22 @@ use crate::cli::api_cmd::ApiArgs;
 use crate::cli::Root;
 use crate::cmd::resolve;
 use crate::error::Error;
+
+/// Run one `api` passthrough request.
+///
+/// # Errors
+///
+/// Returns [`Error::Usage`] for malformed fields or invalid flag
+/// combinations and [`Error`] when the request fails.
 pub fn run(root: &Root, args: &ApiArgs) -> Result<(), Error> {
-    let ctx = resolve(root, root.hostname.as_deref())?;
+    // Validate and build the request before resolving the context: usage
+    // errors must not depend on a resolvable git remote or host config.
     let mut query: Vec<(String, String)> = Vec::new();
 
     // -F style: ":id=value" sets a path field (replaces :id in the path);
     // "key=value" becomes a query parameter.
-    let mut path_fields: std::collections::BTreeMap<String, String> = Default::default();
+    let mut path_fields: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for f in &args.fields {
         match f.split_once('=') {
             Some((k, v)) if k.starts_with(':') => {
@@ -38,6 +47,20 @@ pub fn run(root: &Root, args: &ApiArgs) -> Result<(), Error> {
         }
         None => None,
     };
+
+    // Same rule as clap's `requires`: `--page` needs `--paginate`, and
+    // pagination is GET-only.
+    if let Some(p) = args.page {
+        if !args.paginate {
+            return Err(Error::usage("--page requires --paginate"));
+        }
+        if args.method != "GET" {
+            return Err(Error::usage("--paginate requires GET"));
+        }
+        query.push(("page".into(), p.to_string()));
+    }
+
+    let ctx = resolve(root, root.hostname.as_deref())?;
 
     if args.paginate {
         if args.method != "GET" {

@@ -5,6 +5,12 @@ use tabled::settings::Style;
 use crate::error::Error;
 
 /// Render a list of items as a table or raw JSON.
+///
+/// Empty lists print `No results` (not an error — an empty result is normal).
+///
+/// # Errors
+///
+/// Returns [`Error`] when JSON serialization fails.
 pub fn render_list(items: &[Value], headers: &[&str], json_mode: bool) -> Result<(), Error> {
     if json_mode {
         print_json(&Value::Array(items.to_vec()))?;
@@ -29,6 +35,10 @@ pub fn render_list(items: &[Value], headers: &[&str], json_mode: bool) -> Result
 }
 
 /// Render a single item as field/value rows.
+///
+/// # Errors
+///
+/// Returns [`Error`] when JSON serialization fails.
 pub fn render_one(item: &Value, fields: &[&str], json_mode: bool) -> Result<(), Error> {
     if json_mode {
         print_json(item)?;
@@ -43,6 +53,11 @@ pub fn render_one(item: &Value, fields: &[&str], json_mode: bool) -> Result<(), 
     Ok(())
 }
 
+/// Print a value as pretty JSON on stdout (the scripting-friendly form).
+///
+/// # Errors
+///
+/// Returns [`Error`] when serialization fails.
 pub fn print_json(v: &Value) -> Result<(), Error> {
     println!(
         "{}",

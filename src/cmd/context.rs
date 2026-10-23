@@ -26,6 +26,18 @@ fn detect_ci() -> Option<CiEnv> {
 /// Lowercase a hostname and strip an optional scheme, so that a checkout on
 /// `https://Host:443/...` and `auth login --hostname host` look up the same
 /// hosts.toml entry. Explicit non-default ports are kept.
+///
+/// # Examples
+///
+/// ```
+/// use glabrs::cmd::normalize_host;
+///
+/// assert_eq!(normalize_host("GitLab.Corp.Example:443"), "gitlab.corp.example");
+/// assert_eq!(normalize_host("https://h.example/"), "h.example");
+/// // Custom ports are kept distinct.
+/// assert_eq!(normalize_host("h.example:8443"), "h.example:8443");
+/// ```
+#[must_use]
 pub fn normalize_host(h: &str) -> String {
     let mut s = h.trim().to_ascii_lowercase();
     if let Some(rest) = s.strip_prefix("https://") {
@@ -45,15 +57,26 @@ pub fn normalize_host(h: &str) -> String {
 
 /// Resolve the target host, merge settings per precedence, and build the client.
 ///
-/// Precedence: flags > env (GLABRS_HOST / GITLAB_HOST / GITLAB_TOKEN / CI) >
+/// Precedence: flags > env (`GLABRS_HOST` / `GITLAB_HOST` / `GITLAB_TOKEN` / CI) >
 /// per-host > global.
+///
+/// # Errors
+///
+/// Returns [`Error`] when hosts.toml/config.toml cannot be loaded, or when
+/// the per-host CA file cannot be read.
+///
+/// # Panics
+///
+/// Never: TLS setup failures are impossibility proofs (safe default protocol
+/// versions are always available in rustls).
 pub fn resolve(root: &Root, hostname_flag: Option<&str>) -> Result<Ctx, Error> {
     warn_insecure(root);
     let hosts = config::hosts::Hosts::load()?;
     let cfg = config::store::Config::load()?;
 
     // CI detection first: inside a GitLab job, CI_API_V4_URL is authoritative
-    // and no stored credentials are needed. GITLAB_TOKEN still overrides.
+    // and no stored credentials are needed. The --token flag (clap-populated
+    // from GITLAB_TOKEN) still overrides CI.
     let ci = detect_ci();
     let hostname = match hostname_flag
         .map(normalize_host)
@@ -92,16 +115,13 @@ pub fn resolve(root: &Root, hostname_flag: Option<&str>) -> Result<Ctx, Error> {
         .or_else(|| cfg.get_str("api_url"))
         .unwrap_or_else(|| format!("https://{hostname}/api/v4"));
 
-    // Token precedence: --token flag > GITLAB_TOKEN env > CI_JOB_TOKEN > stored.
-    let token: Option<(String, TokenKind)> = if let Some(t) = &root.token {
-        Some((t.clone(), TokenKind::Personal))
-    } else if let Some(t) = std::env::var("GITLAB_TOKEN").ok().filter(|t| !t.is_empty()) {
-        Some((t, TokenKind::Personal))
-    } else if let Some(c) = &ci {
-        Some((c.token.clone(), TokenKind::Job))
-    } else {
-        host_cfg.token.clone().map(|t| (t, TokenKind::Personal))
-    };
+    // Token precedence: --token flag / GITLAB_TOKEN (clap populates the flag
+    // via the `env` attribute) > CI_JOB_TOKEN > stored token.
+    let token = match token_flag(root.token.as_ref()) {
+        Some(t) => Some((t, TokenKind::Personal)),
+        None => ci.map(|c| (c.token, TokenKind::Job)),
+    }
+    .or_else(|| host_cfg.token.clone().map(|t| (t, TokenKind::Personal)));
 
     let mut headers = host_cfg.headers.clone().unwrap_or_default();
     if let Some(h) = cfg.get("headers") {
@@ -129,18 +149,29 @@ pub fn resolve(root: &Root, hostname_flag: Option<&str>) -> Result<Ctx, Error> {
     })
 }
 
-/// Derive the web base from an api_url:
+/// Derive the web base from an `api_url`, keeping the scheme (and prefix):
 /// `https://host[:port]/prefix/api/v4` -> `https://host[:port]/prefix`.
+///
+/// Delegates to [`instance_root`], which owns the `/api/v4` boundary. The
+/// result is only trusted when it parses as an absolute http(s) URL with a
+/// host (`instance_root` echoes unparseable input unchanged); otherwise fall
+/// back to `https://host` so garbage never becomes a URL.
 fn web_base_from_api(api_url: &str, hostname: &str) -> String {
-    let trimmed = api_url.trim_end_matches('/');
-    let without_api = match trimmed.strip_suffix("/api/v4") {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => format!("https://{hostname}"),
-    };
-    without_api
+    let root = crate::api::client::instance_root(api_url);
+    let trusted = url::Url::parse(&root)
+        .ok()
+        .filter(|u| u.host_str().is_some() && matches!(u.scheme(), "http" | "https"));
+    match trusted {
+        Some(_) => root,
+        None => format!("https://{hostname}"),
+    }
 }
 
 /// Build a ureq agent honoring per-host CA, OS trust roots, and --insecure.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the per-host CA file cannot be read or parsed.
 pub fn build_agent(host_cfg: &config::HostConfig, insecure: bool) -> Result<ureq::Agent, Error> {
     let tls = match &host_cfg.ca_file {
         Some(ca_path) => {
@@ -158,7 +189,7 @@ pub fn build_agent(host_cfg: &config::HostConfig, insecure: bool) -> Result<ureq
             }
             client_config_with_roots(roots)
         }
-        None => default_client_config()?,
+        None => default_client_config(),
     };
     // --insecure overrides certificate checking regardless of the trust roots
     // configured above; the loud warning is printed at dispatch time.
@@ -179,7 +210,7 @@ pub fn build_agent(host_cfg: &config::HostConfig, insecure: bool) -> Result<ureq
 /// bundled webpki roots when the store is unavailable or empty (bare
 /// containers). This fixes corporate proxies with private roots that the OS
 /// already trusts.
-fn default_client_config() -> Result<rustls::ClientConfig, Error> {
+fn default_client_config() -> rustls::ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     for cert in native.certs {
@@ -193,7 +224,7 @@ fn default_client_config() -> Result<rustls::ClientConfig, Error> {
     if roots.is_empty() {
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
-    Ok(client_config_with_roots(roots))
+    client_config_with_roots(roots)
 }
 
 /// Explicit crypto provider: the dependency graph can pull in more than one
@@ -277,6 +308,23 @@ pub fn warn_insecure(root: &Root) {
     }
 }
 
+/// Resolve the `--token` flag (clap populates it from `GITLAB_TOKEN` via the
+/// `env` attribute) into a usable token value.
+///
+/// Pure so the empty-value rule is testable without a server: clap captures
+/// `env::var_os`, so an empty `GITLAB_TOKEN` (a common CI
+/// exported-empty-variable artifact) reaches the flag as `Some("")` — treating
+/// that as a token would send an anonymous request instead of falling through
+/// to `CI_JOB_TOKEN` or the stored token. Empty means unset.
+fn token_flag(flag: Option<&String>) -> Option<String> {
+    // One allocation: trim borrows, the owned String is created only for the
+    // value that is actually returned.
+    flag.map(String::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,13 +362,18 @@ mod tests {
             web_base_from_api("https://h.example/gitlab/api/v4", "h.example"),
             "https://h.example/gitlab"
         );
+        // No api/v4 suffix: keep the api_url's scheme.
         assert_eq!(
-            web_base_from_api("https://h.example/api/v4", "h.example"),
-            "https://h.example"
+            web_base_from_api("http://h.example:8080/custom", "h.example"),
+            "http://h.example:8080"
         );
-        // No api/v4 suffix: fall back to the default web URL.
         assert_eq!(
             web_base_from_api("https://h.example/custom", "h.example"),
+            "https://h.example"
+        );
+        // Unparseable URL: fall back to the default web URL.
+        assert_eq!(
+            web_base_from_api("not a url", "h.example"),
             "https://h.example"
         );
     }
@@ -341,5 +394,16 @@ mod tests {
         assert_eq!(api_url, "https://127.0.0.1:8931/api/v4");
         // Default ports are still dropped from the hostname.
         assert_eq!(normalize_host("gitlab.example:443"), "gitlab.example");
+    }
+
+    #[test]
+    fn token_flag_empty_means_unset() {
+        // Empty / whitespace-only values fall through to the next source
+        // (CI_JOB_TOKEN / stored token); anything else is used as-is.
+        assert_eq!(token_flag(Some(&"tok".into())), Some("tok".into()));
+        assert_eq!(token_flag(Some(&" tok ".into())), Some("tok".into()));
+        assert_eq!(token_flag(Some(&String::new())), None);
+        assert_eq!(token_flag(Some(&"   ".into())), None);
+        assert_eq!(token_flag(None), None);
     }
 }

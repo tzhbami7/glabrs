@@ -4,7 +4,13 @@ use std::process::{Command, Stdio};
 use crate::error::Error;
 
 /// Run a pager over `content` unless disabled or stdout is not a terminal.
-/// Pager selection: `GLABRS_PAGER` > `PAGER` > `less`.
+/// Pager selection: `GLABRS_PAGER` > `PAGER` > config `pager` > `less`.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the pager cannot be spawned or exits nonzero. An
+/// early pager exit (`less` quit with `q`, surfacing as EPIPE) is normal
+/// interactive behavior, not an error.
 pub fn page(content: &str, no_pager: bool) -> Result<(), Error> {
     if no_pager || !std::io::stdout().is_terminal() {
         print!("{content}");
@@ -12,7 +18,15 @@ pub fn page(content: &str, no_pager: bool) -> Result<(), Error> {
     }
     let pager = std::env::var("GLABRS_PAGER")
         .or_else(|_| std::env::var("PAGER"))
-        .unwrap_or_else(|_| "less".to_string());
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .or_else(|| {
+            crate::config::Config::load()
+                .ok()
+                .and_then(|c| c.get_str("pager"))
+        })
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "less".to_string());
     let mut child = Command::new(&pager)
         .stdin(Stdio::piped())
         .spawn()
@@ -34,6 +48,10 @@ pub fn page(content: &str, no_pager: bool) -> Result<(), Error> {
 }
 
 /// Read text from a file, or stdin when path is `-`.
+///
+/// # Errors
+///
+/// Returns [`Error`] when reading the file (or stdin) fails.
 pub fn read_input(path: &str) -> Result<String, Error> {
     let mut s = String::new();
     if path == "-" {

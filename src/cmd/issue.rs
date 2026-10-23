@@ -1,11 +1,16 @@
 use serde_json::{json, Value};
 
 use crate::cli::issue_cmd::IssueArgs;
-use crate::cli::Root;
+use crate::cli::{ListOpts, Root};
 use crate::cmd::helpers;
 use crate::cmd::resolve;
 use crate::error::Error;
 
+/// Run one `issue` subcommand.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the request fails or a body file cannot be read.
 pub fn run(root: &Root, args: &IssueArgs) -> Result<(), Error> {
     match args {
         IssueArgs::List {
@@ -13,11 +18,14 @@ pub fn run(root: &Root, args: &IssueArgs) -> Result<(), Error> {
             author,
             labels,
             state,
-            per_page,
-            page,
-            paginate,
+            list: list_opts,
         } => list(
-            root, assignee, author, labels, state, *per_page, *page, *paginate,
+            root,
+            assignee.as_ref(),
+            author.as_ref(),
+            labels.as_ref(),
+            state.as_ref(),
+            list_opts,
         ),
         IssueArgs::Create {
             title,
@@ -29,11 +37,11 @@ pub fn run(root: &Root, args: &IssueArgs) -> Result<(), Error> {
         } => create(
             root,
             title,
-            description,
-            description_file,
-            labels,
-            milestone,
-            assignee,
+            description.as_ref(),
+            description_file.as_ref(),
+            labels.as_ref(),
+            milestone.as_ref(),
+            assignee.as_ref(),
         ),
         IssueArgs::View { iid, web } => view(root, *iid, *web),
         IssueArgs::Close { iid } => set_state(root, *iid, "close"),
@@ -42,7 +50,7 @@ pub fn run(root: &Root, args: &IssueArgs) -> Result<(), Error> {
             iid,
             body,
             body_file,
-        } => comment(root, *iid, body, body_file),
+        } => comment(root, *iid, body.as_ref(), body_file.as_ref()),
         IssueArgs::Delete { iid, yes } => delete(root, *iid, *yes),
     }
 }
@@ -50,27 +58,26 @@ pub fn run(root: &Root, args: &IssueArgs) -> Result<(), Error> {
 /// Resolve project path: --repo/-R > git remote.
 use helpers::project_path;
 
-#[allow(clippy::too_many_arguments)]
 fn list(
     root: &Root,
-    assignee: &Option<String>,
-    author: &Option<String>,
-    labels: &Option<String>,
-    state: &Option<String>,
-    per_page: u32,
-    page: Option<u32>,
-    paginate: bool,
+    assignee: Option<&String>,
+    author: Option<&String>,
+    labels: Option<&String>,
+    state: Option<&String>,
+    opts: &ListOpts,
 ) -> Result<(), Error> {
+    let per_page = opts.per_page;
+    let page = opts.page;
+    let paginate = opts.paginate;
     let pp = project_path(root)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut query: Vec<(String, String)> = vec![("per_page".into(), per_page.to_string())];
     if let Some(a) = assignee {
         if a == "@me" {
-            if ctx.can_resolve_current_user() {
-                query.push(("assignee_id".into(), helpers::my_id(&ctx)?.to_string()));
-            } else {
-                return Err(helpers::at_me_needs_personal_token("--assignee"));
-            }
+            query.push((
+                "assignee_id".into(),
+                helpers::user_flag_id(&ctx, a, "--assignee")?.to_string(),
+            ));
         } else {
             query.push((
                 "assignee_username".into(),
@@ -80,11 +87,10 @@ fn list(
     }
     if let Some(a) = author {
         if a == "@me" {
-            if ctx.can_resolve_current_user() {
-                query.push(("author_id".into(), helpers::my_id(&ctx)?.to_string()));
-            } else {
-                return Err(helpers::at_me_needs_personal_token("--author"));
-            }
+            query.push((
+                "author_id".into(),
+                helpers::user_flag_id(&ctx, a, "--author")?.to_string(),
+            ));
         } else {
             query.push((
                 "author_username".into(),
@@ -98,16 +104,17 @@ fn list(
     if let Some(s) = state {
         query.push(("state".into(), s.clone()));
     }
+    // Pushed unconditionally: honored as the start page under --paginate
+    // (get_paginated dedups it) and as the single page otherwise.
+    if let Some(p) = page {
+        query.push(("page".into(), p.to_string()));
+    }
     let items: Vec<Value> = if paginate {
         ctx.client()
             .get_paginated(&format!("projects/{pp}/issues"), &query, None)?
     } else {
-        let mut q = query;
-        if let Some(p) = page {
-            q.push(("page".into(), p.to_string()));
-        }
         ctx.client()
-            .get_json_vec(&format!("projects/{pp}/issues"), &q)?
+            .get_json_vec(&format!("projects/{pp}/issues"), &query)?
     };
     crate::render::table::render_list(
         &items,
@@ -127,11 +134,11 @@ fn list(
 fn create(
     root: &Root,
     title: &str,
-    description: &Option<String>,
-    description_file: &Option<String>,
-    labels: &Option<String>,
-    milestone: &Option<String>,
-    assignee: &Option<String>,
+    description: Option<&String>,
+    description_file: Option<&String>,
+    labels: Option<&String>,
+    milestone: Option<&String>,
+    assignee: Option<&String>,
 ) -> Result<(), Error> {
     let pp = project_path(root)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
@@ -149,16 +156,9 @@ fn create(
         body["milestone_id"] = Value::Number(mid.into());
     }
     if let Some(a) = assignee {
-        let uid = if a == "@me" {
-            if ctx.can_resolve_current_user() {
-                helpers::my_id(&ctx)?
-            } else {
-                return Err(helpers::at_me_needs_personal_token("--assignee"));
-            }
-        } else {
-            helpers::user_id(&ctx, a)?
-        };
-        body["assignee_ids"] = Value::Array(vec![Value::Number(uid.into())]);
+        body["assignee_ids"] = Value::Array(vec![Value::Number(
+            helpers::user_flag_id(&ctx, a, "--assignee")?.into(),
+        )]);
     }
     let issue: Value =
         ctx.client()
@@ -206,11 +206,12 @@ fn view(root: &Root, iid: u64, web: bool) -> Result<(), Error> {
 fn set_state(root: &Root, iid: u64, event: &str) -> Result<(), Error> {
     let pp = project_path(root)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
+    // state_event belongs in the body, like every other mutation.
     let issue: Value = ctx.client().send_json_value(
         "PUT",
         &format!("projects/{pp}/issues/{iid}"),
-        &[("state_event".into(), event.to_string())],
-        None,
+        &[],
+        Some(json!({ "state_event": event })),
     )?;
     crate::render::table::render_one(&issue, &["iid", "title", "state"], ctx.json)?;
     Ok(())
@@ -219,8 +220,8 @@ fn set_state(root: &Root, iid: u64, event: &str) -> Result<(), Error> {
 fn comment(
     root: &Root,
     iid: u64,
-    body: &Option<String>,
-    body_file: &Option<String>,
+    body: Option<&String>,
+    body_file: Option<&String>,
 ) -> Result<(), Error> {
     let pp = project_path(root)?;
     let ctx = resolve(root, root.hostname.as_deref())?;

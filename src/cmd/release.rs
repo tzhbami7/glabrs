@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use serde_json::{json, Value};
 
 use crate::cli::release_cmd::ReleaseArgs;
@@ -6,19 +8,20 @@ use crate::cmd::helpers;
 use crate::cmd::resolve;
 use crate::error::Error;
 
+/// Run one `release` subcommand.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the request fails or a notes file cannot be read.
 pub fn run(root: &Root, args: &ReleaseArgs) -> Result<(), Error> {
     match args {
-        ReleaseArgs::List {
-            per_page,
-            page,
-            paginate,
-        } => list(root, *per_page, *page, *paginate),
+        ReleaseArgs::List { list: list_opts } => list(root, list_opts),
         ReleaseArgs::Create {
             tag,
             notes_file,
             name,
             ref_,
-        } => create(root, tag, notes_file, name, ref_),
+        } => create(root, tag, notes_file.as_ref(), name.as_ref(), ref_.as_ref()),
         ReleaseArgs::View { tag } => view(root, tag),
         ReleaseArgs::Delete { tag, yes } => delete(root, tag, *yes),
         ReleaseArgs::Upload {
@@ -32,7 +35,10 @@ pub fn run(root: &Root, args: &ReleaseArgs) -> Result<(), Error> {
 
 use helpers::project_path;
 
-fn list(root: &Root, per_page: u32, page: Option<u32>, paginate: bool) -> Result<(), Error> {
+fn list(root: &Root, opts: &crate::cli::ListOpts) -> Result<(), Error> {
+    let per_page = opts.per_page;
+    let page = opts.page;
+    let paginate = opts.paginate;
     let pp = project_path(root)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut query: Vec<(String, String)> = vec![("per_page".into(), per_page.to_string())];
@@ -56,9 +62,9 @@ fn list(root: &Root, per_page: u32, page: Option<u32>, paginate: bool) -> Result
 fn create(
     root: &Root,
     tag: &str,
-    notes_file: &Option<String>,
-    name: &Option<String>,
-    ref_: &Option<String>,
+    notes_file: Option<&String>,
+    name: Option<&String>,
+    ref_: Option<&String>,
 ) -> Result<(), Error> {
     let pp = project_path(root)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
@@ -153,11 +159,14 @@ fn upload(
     if !path.exists() {
         return Err(Error::not_found(format!("file not found: {target}")));
     }
-    let file_name = name.map(String::from).unwrap_or_else(|| {
-        path.file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default()
-    });
+    let file_name = name.map_or_else(
+        || {
+            path.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default()
+        },
+        String::from,
+    );
     let bytes = std::fs::read(path)?;
     let content_type = guess_content_type(&file_name);
     let uploaded: Value = upload_file(&ctx, &pp, &bytes, &content_type, &file_name)?;
@@ -171,7 +180,7 @@ fn upload(
     // prefix), not the project web URL — /uploads lives at instance scope.
     let rel = extract_upload_path(url)
         .ok_or_else(|| Error::runtime(format!("unexpected upload url: {url}")))?;
-    let root_base = instance_root(&ctx.client().api_url);
+    let root_base = crate::api::client::instance_root(&ctx.client().api_url);
     let full_url = format!("{root_base}{rel}");
     let body = json!({ "name": file_name, "url": full_url });
     let created: Value = ctx.client().send_json_value(
@@ -193,13 +202,13 @@ fn upload_file(
 ) -> Result<Value, Error> {
     // Multipart upload to /uploads. The boundary must be unpredictable enough
     // not to collide with file content or concurrent uploads.
-    let boundary = random_boundary();
+    let boundary = random_boundary()?;
     let mut body: Vec<u8> = Vec::with_capacity(bytes.len() + 512);
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     body.extend_from_slice(
         format!(
             "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\nContent-Type: {content_type}\r\n\r\n",
-            escape_header_value(file_name)
+            escape_header_value(file_name)?
         )
         .as_bytes(),
     );
@@ -207,10 +216,8 @@ fn upload_file(
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
     let url = ctx.client().url(&format!("projects/{pp}/uploads"), &[]);
-    let mut req = ctx.client().agent_post(&url)?;
-    for (k, v) in ctx.client().extra_headers() {
-        req = req.set(k, v);
-    }
+    // agent_post already applies auth (token + per-host headers).
+    let req = ctx.client().agent_post(&url)?;
     let resp = req
         .set(
             "Content-Type",
@@ -221,22 +228,41 @@ fn upload_file(
 }
 
 /// Random hex boundary per RFC 2046 (68 chars max; 32 hex chars is plenty).
-fn random_boundary() -> String {
+fn random_boundary() -> Result<String, Error> {
     let mut buf = [0u8; 16];
-    getrandom(&mut buf);
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    getrandom(&mut buf)?;
+    let mut out = String::with_capacity(buf.len() * 2);
+    for b in buf {
+        let _ = write!(out, "{b:02x}");
+    }
+    Ok(out)
 }
 
-fn getrandom(buf: &mut [u8]) {
+/// Fill `buf` with random bytes from /dev/urandom, propagating failure as a
+/// runtime error (a panic here would abort an otherwise useful upload).
+fn getrandom(buf: &mut [u8]) -> Result<(), Error> {
     use std::fs::File;
     use std::io::Read;
     File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(buf))
-        .expect("read /dev/urandom");
+        .map_err(|e| Error::runtime(format!("read /dev/urandom: {e}")))
 }
 
-/// Escape `"` and backslashes in a filename per RFC 2183 quoted-string rules.
-fn escape_header_value(s: &str) -> String {
+/// Escape a filename for a quoted-string header value per RFC 2183: quote and
+/// backslash are escaped, and control characters are rejected outright so a
+/// crafted filename cannot inject headers or break the multipart framing.
+/// (CR/LF was the header-injection risk; the rest of C0 would corrupt the
+/// boundary framing, which is just as fatal for the upload.)
+///
+/// # Errors
+///
+/// Returns [`Error::Usage`] when the filename contains a control character.
+fn escape_header_value(s: &str) -> Result<String, Error> {
+    if s.chars().any(char::is_control) {
+        return Err(Error::usage(format!(
+            "filename contains a control character (refusing to upload): {s:?}"
+        )));
+    }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if c == '"' || c == '\\' {
@@ -244,7 +270,7 @@ fn escape_header_value(s: &str) -> String {
         }
         out.push(c);
     }
-    out
+    Ok(out)
 }
 
 /// Accept both a bare relative path (`/uploads/h/file`) and the markdown link
@@ -259,31 +285,6 @@ fn extract_upload_path(url: &str) -> Option<String> {
         Some(url.to_string())
     } else {
         None
-    }
-}
-
-/// Reduce an API URL to the instance root: `https://host[:port]/prefix/api/v4`
-/// -> `https://host[:port]/prefix`. `/uploads` lives at instance scope, and
-/// the api_url (unlike a project web URL) ends in a known `/api/v4` suffix,
-/// so the prefix boundary is unambiguous.
-fn instance_root(api_url: &str) -> String {
-    let trimmed = api_url.trim_end_matches('/');
-    if let Some(base) = trimmed.strip_suffix("/api/v4") {
-        if !base.is_empty() {
-            return base.to_string();
-        }
-    }
-    // No /api/v4 suffix: fall back to scheme + host[:port].
-    match url::Url::parse(trimmed) {
-        Ok(u) => {
-            let host = match (u.host_str(), u.port()) {
-                (Some(h), Some(p)) => format!("{h}:{p}"),
-                (Some(h), None) => h.to_string(),
-                _ => String::new(),
-            };
-            format!("{}://{}", u.scheme(), host)
-        }
-        Err(_) => trimmed.to_string(),
     }
 }
 
@@ -315,25 +316,21 @@ mod tests {
     }
 
     #[test]
-    fn instance_root_scenarios() {
-        // Derived from the api_url, which ends in /api/v4.
-        assert_eq!(
-            instance_root("https://gitlab.corp.example/api/v4"),
-            "https://gitlab.corp.example"
-        );
-        assert_eq!(
-            instance_root("https://gitlab.corp.example/gitlab/api/v4"),
-            "https://gitlab.corp.example/gitlab"
-        );
-        assert_eq!(
-            instance_root("http://localhost:8080/api/v4"),
-            "http://localhost:8080"
-        );
+    fn escape_header_value_rejects_controls() {
+        assert!(escape_header_value("ok.txt").is_ok());
+        assert!(escape_header_value("bad\r\nHeader: x").is_err());
+        assert!(escape_header_value("bad\nHeader: x").is_err());
+        assert!(escape_header_value("bad\rHeader: x").is_err());
+        // Other C0 controls would corrupt the multipart framing.
+        assert!(escape_header_value("bad\tname.txt").is_err());
+        assert!(escape_header_value("bad\0name.txt").is_err());
     }
 
     #[test]
     fn random_boundaries_differ() {
-        assert_ne!(random_boundary(), random_boundary());
-        assert_eq!(random_boundary().len(), 32);
+        let first = random_boundary().unwrap();
+        let second = random_boundary().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 32);
     }
 }

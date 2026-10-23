@@ -4,6 +4,13 @@ use crate::cli::completion_cmd::CompletionArgs;
 use crate::cli::Root;
 use crate::error::Error;
 
+/// Generate a shell completion script and print its path.
+///
+/// The output directory is `GLABRS_COMPLETION_OUT` (default `.`).
+///
+/// # Errors
+///
+/// Returns [`Error`] when `clap_complete` cannot write the script file.
 pub fn generate(args: &CompletionArgs) -> Result<(), Error> {
     let mut cmd = <Root as clap::CommandFactory>::command();
     let name = "glabrs";

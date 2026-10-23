@@ -4,6 +4,12 @@ use crate::config::Hosts;
 use crate::error::Error;
 use crate::render::pager::read_input;
 
+/// Run one `auth` subcommand (login validates the token before storing).
+///
+/// # Errors
+///
+/// Returns [`Error::Auth`] for invalid tokens and [`Error`] for I/O or
+/// request failures.
 pub fn run(root: &Root, args: &AuthArgs) -> Result<(), Error> {
     match args {
         AuthArgs::Login {
@@ -11,21 +17,27 @@ pub fn run(root: &Root, args: &AuthArgs) -> Result<(), Error> {
             token,
             ca_file,
             api_url,
-        } => login(root, hostname, token, ca_file, api_url),
-        AuthArgs::Status { hostname } => status(root, hostname),
-        AuthArgs::Logout { hostname } => logout(root, hostname),
+        } => login(
+            root,
+            hostname.as_ref(),
+            token.as_ref(),
+            ca_file.as_ref(),
+            api_url.as_ref(),
+        ),
+        AuthArgs::Status { hostname } => status(root, hostname.as_ref()),
+        AuthArgs::Logout { hostname } => logout(root, hostname.as_ref()),
     }
 }
 
 fn login(
     root: &Root,
-    hostname_flag: &Option<String>,
-    token_arg: &Option<String>,
-    ca_file: &Option<String>,
-    api_url: &Option<String>,
+    hostname_flag: Option<&String>,
+    token_arg: Option<&String>,
+    ca_file: Option<&String>,
+    api_url: Option<&String>,
 ) -> Result<(), Error> {
     let hostname = match hostname_flag
-        .clone()
+        .cloned()
         .or_else(|| std::env::var("GLABRS_HOST").ok())
         .or_else(|| std::env::var("GITLAB_HOST").ok())
     {
@@ -38,9 +50,9 @@ fn login(
     };
 
     // Token: --token > stdin (`-`) > hidden prompt.
-    let token = match token_arg {
-        Some(t) if t == "-" => read_input("-")?.trim().to_string(),
-        Some(t) => t.clone(),
+    let token = match token_arg.map(String::as_str) {
+        Some("-") => read_input("-")?.trim().to_string(),
+        Some(t) => t.to_string(),
         None => rpassword::prompt_password(format!("Paste token for {hostname}: "))?,
     };
     if token.is_empty() {
@@ -49,9 +61,9 @@ fn login(
 
     let host_cfg = crate::config::HostConfig {
         token: Some(token.clone()),
-        api_url: api_url.clone(),
-        ca_file: ca_file.clone(),
-        ..Default::default()
+        api_url: api_url.cloned(),
+        ca_file: ca_file.cloned(),
+        ..crate::config::HostConfig::default()
     };
 
     // Validate the token against GET /user before storing.
@@ -63,9 +75,9 @@ fn login(
     }
     let settings = crate::api::client::HostSettings {
         api_url: api_url
-            .clone()
-            .unwrap_or_else(|| format!("https://{hostname}/api/v4")),
-        headers: Default::default(),
+            .map(String::as_str)
+            .map_or_else(|| format!("https://{hostname}/api/v4"), str::to_string),
+        headers: std::collections::BTreeMap::new(),
     };
     let client = crate::api::Client::new(
         agent,
@@ -89,19 +101,18 @@ fn login(
     }
     hosts.save()?;
 
-    if !root.json {
-        println!("Authenticated as {username} on {hostname}");
-    } else {
+    if root.json {
         crate::render::table::print_json(&user)?;
+    } else {
+        println!("Authenticated as {username} on {hostname}");
     }
     Ok(())
 }
 
-fn status(root: &Root, hostname_flag: &Option<String>) -> Result<(), Error> {
-    let _ = root;
+fn status(root: &Root, hostname_flag: Option<&String>) -> Result<(), Error> {
     let hosts = Hosts::load()?;
     let hostname = match hostname_flag
-        .clone()
+        .cloned()
         .or_else(|| std::env::var("GLABRS_HOST").ok())
         .or_else(|| std::env::var("GITLAB_HOST").ok())
     {
@@ -123,7 +134,7 @@ fn status(root: &Root, hostname_flag: &Option<String>) -> Result<(), Error> {
     let agent = crate::cmd::build_agent(&host_cfg, root.insecure)?;
     let settings = crate::api::client::HostSettings {
         api_url,
-        headers: Default::default(),
+        headers: std::collections::BTreeMap::new(),
     };
     let client = crate::api::Client::new(
         agent,
@@ -147,11 +158,10 @@ fn status(root: &Root, hostname_flag: &Option<String>) -> Result<(), Error> {
     Ok(())
 }
 
-fn logout(root: &Root, hostname_flag: &Option<String>) -> Result<(), Error> {
-    let _ = root;
+fn logout(root: &Root, hostname_flag: Option<&String>) -> Result<(), Error> {
     let mut hosts = Hosts::load()?;
     let hostname = match hostname_flag
-        .clone()
+        .cloned()
         .or_else(|| std::env::var("GLABRS_HOST").ok())
         .or_else(|| std::env::var("GITLAB_HOST").ok())
     {

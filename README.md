@@ -21,8 +21,9 @@ glabrs mr approve 235
 glabrs issue create --title "Bug" --label important --milestone v2.1
 glabrs ci status --wait          # exit code mirrors pipeline result
 glabrs ci trace test-job         # live job log, streamed by polling
+glabrs ci trace build --follow --pipeline 235   # job in a specific pipeline
 glabrs release create v1.2.0 --notes-file -
-glabrs api projects/42/issues --paginate | jq '.[].title'
+glabrs api projects/42/issues --paginate --page 2 | jq '.[].title'
 ```
 
 ## Commands
@@ -53,14 +54,16 @@ glabrs api projects/42/issues --paginate | jq '.[].title'
 
 Files live in `~/.config/glabrs/`:
 
-- `config.toml` — global settings (`api_url`, custom `headers`)
+- `config.toml` — global settings (`api_url`, `pager`, custom `headers`)
 - `hosts.toml` — per host: `token`, `api_url`, `ca_file`, `client_cert`/`client_key`, custom `headers`
 
 Precedence: flags > env (`GLABRS_HOST`, `GITLAB_HOST`, `GITLAB_TOKEN`) > per-host > global.
 
 ### Token precedence
 
-`--token` flag > `GITLAB_TOKEN` env > `CI_JOB_TOKEN` (when in CI) > stored token.
+`--token` flag (= `GITLAB_TOKEN` env, applied by clap) > `CI_JOB_TOKEN` (when in CI) > stored token.
+An empty or whitespace-only `GITLAB_TOKEN` counts as unset and falls through to
+the next source.
 
 Inside CI, `CI_JOB_TOKEN` + `CI_API_V4_URL` are detected automatically — no stored
 credentials needed. Job tokens are sent as `JOB-TOKEN` and authenticate
@@ -70,6 +73,12 @@ code 3 under a job token.
 
 Note: OS trust roots are used by default, so corporate proxies with a private
 root installed in the system store work without extra configuration.
+
+Note: http-only instances (no TLS) need an explicit `api_url` in config —
+derived URLs always use `https://`.
+
+Note: credentials are stored with unix permissions (0600) and the binary
+targets unix systems (Linux, macOS).
 
 ## Self-hosted connection guide
 
@@ -117,9 +126,17 @@ token travels over an unverified connection). Prefer `ca_file`.
 
 - `--json` on list/view commands emits the raw GitLab API response — pipe straight to `jq`.
 - `--paginate` follows `X-Next-Page` until exhausted (hard cap: 10,000 pages).
+- `--paginate --page` starts fetching at the given page (every list command and
+  `api --paginate`; sent exactly once, no duplicated parameter). List commands
+  accept `--page` alone as a single-page fetch; `api` requires `--paginate`
+  with `--page`. `--page` must be ≥ 1 and `--per-page` must be 1–100 — both are
+  rejected by argument validation otherwise.
 - `--verbose` prints API method and path only — never headers or tokens.
-- `$EDITOR`-free workflows: `--description-file -` reads stdin; `PAGER` (or
-  `GLABRS_PAGER`) is honored for long output; `--no-pager` bypasses it.
+- `--description-file -` reads stdin; long output uses `GLABRS_PAGER` >
+  `PAGER` > config `pager` > `less`; `--no-pager` bypasses it.
+- `-R` accepts a numeric ID, `owner/name`, `group/sub/name`, an
+  already-encoded path, or a full URL with a path — a bare URL with no path
+  (`https://gitlab.com`) is a usage error.
 
 ## License
 

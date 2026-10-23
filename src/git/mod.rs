@@ -1,3 +1,5 @@
+//! Git remote-URL parsing (https, ssh, SCP syntax) and git command helpers.
+
 use std::process::Command;
 
 use crate::error::Error;
@@ -5,6 +7,7 @@ use crate::error::Error;
 /// A parsed git remote URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Remote {
+    /// Remote hostname, lowercased source spelling preserved.
     pub hostname: String,
     /// Project path with leading/trailing slashes and `.git` stripped.
     pub project_path: String,
@@ -20,6 +23,20 @@ pub struct Remote {
 /// The full path is kept: subgroup projects (`group/subgroup/proj`) must not
 /// lose their leading segments, and path-prefixed instances are resolved via
 /// an explicit `api_url` in config rather than guessed here.
+///
+/// # Examples
+///
+/// ```
+/// use glabrs::git::parse_remote;
+///
+/// let r = parse_remote("https://gitlab.com/group/sub/proj.git").unwrap();
+/// assert_eq!(r.hostname, "gitlab.com");
+/// assert_eq!(r.project_path, "group/sub/proj");
+///
+/// let scp = parse_remote("git@gitlab.com:group/proj.git").unwrap();
+/// assert_eq!(scp.project_path, "group/proj");
+/// ```
+#[must_use]
 pub fn parse_remote(url: &str) -> Option<Remote> {
     let url = url.trim();
 
@@ -60,7 +77,9 @@ pub fn parse_remote(url: &str) -> Option<Remote> {
 
 /// Strip surrounding slashes and a `.git` suffix only when it terminates the
 /// final segment (`repo.git` -> `repo`, but `foo.gitbar` stays `foo.gitbar`).
-fn clean_path(path: &str) -> String {
+/// Only one suffix is stripped (`repo.git.git` -> `repo.git`).
+#[must_use]
+pub(crate) fn clean_path(path: &str) -> String {
     let trimmed = path.trim_matches('/');
     match trimmed.strip_suffix(".git") {
         Some(stem) if !stem.is_empty() && !stem.ends_with('/') => stem.to_string(),
@@ -69,12 +88,21 @@ fn clean_path(path: &str) -> String {
 }
 
 /// Read and parse the `origin` remote from the current git checkout.
+///
+/// # Errors
+///
+/// Returns [`Error`] when git fails or the URL cannot be parsed.
 pub fn detect_remote() -> Result<Remote, Error> {
     let url = run_git(&["remote", "get-url", "origin"])?;
     parse_remote(&url).ok_or_else(|| Error::runtime(format!("cannot parse remote URL: {url}")))
 }
 
 /// Run git in the current directory, returning trimmed stdout.
+///
+/// # Errors
+///
+/// Returns [`Error`] when git cannot be spawned or exits nonzero (with its
+/// stderr in the message).
 pub fn run_git(args: &[&str]) -> Result<String, Error> {
     let out = Command::new("git")
         .args(args)

@@ -1,5 +1,8 @@
+//! clap definitions for the `auth` command group.
+
 use clap::Subcommand;
 
+/// Manage authentication.
 #[derive(Subcommand, Debug)]
 pub enum AuthArgs {
     /// Authenticate against a GitLab instance

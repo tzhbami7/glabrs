@@ -1,5 +1,8 @@
+//! clap definitions for the `config` command group.
+
 use clap::Subcommand;
 
+/// Manage configuration.
 #[derive(Subcommand, Debug)]
 pub enum ConfigArgs {
     /// Show merged configuration (flags > env > per-host > global)
@@ -12,7 +15,7 @@ pub enum ConfigArgs {
     },
     /// Set a configuration key
     Set {
-        /// Configuration key, e.g. pager, editor, per-host ca_file
+        /// Configuration key, e.g. `pager`, per-host `ca_file`
         key: String,
         /// Value to store
         value: String,
@@ -22,7 +25,9 @@ pub enum ConfigArgs {
     },
     /// Remove a configuration key
     Unset {
+        /// Configuration key to remove
         key: String,
+        /// Apply to a specific host instead of global config
         #[arg(long)]
         hostname: Option<String>,
     },

@@ -1,10 +1,15 @@
+//! clap definitions for the `repo` command group.
+
 use clap::Subcommand;
 
+use super::ListOpts;
+
+/// Work with repositories and projects.
 #[derive(Subcommand, Debug)]
 pub enum RepoArgs {
     /// Show project details
     View {
-        /// Project ID or owner/name path
+        /// Project ID or owner/name path (default: detected)
         target: Option<String>,
         /// Open in browser
         #[arg(long)]
@@ -12,18 +17,16 @@ pub enum RepoArgs {
     },
     /// List projects (in a group, or your projects)
     List {
+        /// Group path to list projects under (default: your projects)
         #[arg(long)]
         group: Option<String>,
-        #[arg(long, default_value = "20")]
-        per_page: u32,
-        #[arg(long)]
-        page: Option<u32>,
-        #[arg(long)]
-        paginate: bool,
+        #[command(flatten)]
+        /// Paging options.
+        list: ListOpts,
     },
     /// Clone a project by owner/name or URL
     Clone {
-        /// owner/name or full URL
+        /// Project owner/name or full URL
         target: String,
         /// Target directory
         #[arg(long)]

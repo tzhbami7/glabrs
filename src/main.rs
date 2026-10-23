@@ -1,3 +1,5 @@
+//! glabrs binary entry point: parse arguments, dispatch, map errors to exit codes.
+
 use std::process::ExitCode;
 
 use glabrs::cli;

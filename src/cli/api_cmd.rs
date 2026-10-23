@@ -18,7 +18,11 @@ pub struct ApiArgs {
     #[arg(long = "field", short = 'f')]
     pub fields: Vec<String>,
 
-    /// Follow X-Next-Page until exhausted
+    /// Follow X-Next-Page until exhausted (GET only)
     #[arg(long)]
     pub paginate: bool,
+
+    /// Start paginating at this page (requires --paginate)
+    #[arg(long, requires = "paginate", value_parser = clap::value_parser!(u32).range(1..))]
+    pub page: Option<u32>,
 }

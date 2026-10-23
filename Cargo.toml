@@ -35,6 +35,17 @@ url = "2"
 tempfile = "3"
 ureq = { version = "2", features = ["json", "tls"] }
 
+[dependencies.thiserror]
+version = "2"
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = 10 }
+pedantic = { level = "warn", priority = 3 }
+redundant_clone = { level = "warn", priority = 4 }
+
 [profile.release]
 lto = true
 strip = true

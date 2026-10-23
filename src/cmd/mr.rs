@@ -1,11 +1,18 @@
+use std::fmt::Write as _;
+
 use serde_json::{json, Value};
 
 use crate::cli::mr_cmd::MrArgs;
-use crate::cli::Root;
-use crate::cmd::helpers;
+use crate::cli::{ListOpts, Root};
+use crate::cmd::helpers::{self, project_path};
 use crate::cmd::resolve;
 use crate::error::Error;
 
+/// Run one `mr` subcommand.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the request fails or a body file cannot be read.
 pub fn run(root: &Root, args: &MrArgs) -> Result<(), Error> {
     match args {
         MrArgs::List {
@@ -13,11 +20,14 @@ pub fn run(root: &Root, args: &MrArgs) -> Result<(), Error> {
             reviewer,
             author,
             state,
-            per_page,
-            page,
-            paginate,
+            list: list_opts,
         } => list(
-            root, assignee, reviewer, author, state, *per_page, *page, *paginate,
+            root,
+            assignee.as_ref(),
+            reviewer.as_ref(),
+            author.as_ref(),
+            state.as_ref(),
+            list_opts,
         ),
         MrArgs::Create {
             title,
@@ -37,21 +47,23 @@ pub fn run(root: &Root, args: &MrArgs) -> Result<(), Error> {
             web,
         } => create(
             root,
-            title,
-            description,
-            description_file,
-            source_branch,
-            target_branch,
-            *draft,
-            assignee,
-            reviewer,
-            milestone,
-            labels,
-            *fill,
-            *push,
-            *squash,
-            *remove_source_branch,
-            *web,
+            &CreateParams {
+                title,
+                description,
+                description_file,
+                source_branch,
+                target_branch,
+                draft: *draft,
+                assignee,
+                reviewer,
+                milestone,
+                labels,
+                fill: *fill,
+                push: *push,
+                squash: *squash,
+                remove_source_branch: *remove_source_branch,
+                web: *web,
+            },
         ),
         MrArgs::View { iid, web } => view(root, *iid, *web),
         MrArgs::Diff { iid } => diff(root, *iid),
@@ -74,7 +86,7 @@ pub fn run(root: &Root, args: &MrArgs) -> Result<(), Error> {
             iid,
             body,
             body_file,
-        } => comment(root, *iid, body, body_file),
+        } => comment(root, *iid, body.as_ref(), body_file.as_ref()),
         MrArgs::Ready { iid } => ready(root, *iid),
         MrArgs::Update {
             iid,
@@ -87,58 +99,67 @@ pub fn run(root: &Root, args: &MrArgs) -> Result<(), Error> {
         } => update(
             root,
             *iid,
-            title,
-            description,
-            assignee,
-            reviewer,
-            milestone,
-            labels,
+            &UpdateParams {
+                title,
+                description,
+                assignee,
+                reviewer,
+                milestone,
+                labels,
+            },
         ),
     }
 }
 
-use helpers::project_path;
-
 /// Encode an owner/name or owner/subgroup/name path for the API (`/` -> `%2F`),
 /// accepting an already-encoded path and a full URL.
-pub fn encode_project_path(s: &str) -> String {
+///
+/// A bare URL with no project path (`https://gitlab.com`) is a usage error:
+/// silently encoding it would send `https:%2F%2Fgitlab.com` to the API and
+/// surface as a confusing 404.
+///
+/// # Errors
+///
+/// Returns [`Error::Usage`] for a bare URL with no project path.
+pub fn encode_project_path(s: &str) -> Result<String, Error> {
     let s = s.trim().trim_matches('/');
     if let Some(rest) = s
         .strip_prefix("https://")
         .or_else(|| s.strip_prefix("http://"))
     {
-        if let Some(path) = rest.split_once('/').map(|(_, p)| p) {
-            return path
-                .trim_end_matches(".git")
-                .trim_end_matches('/')
-                .replace('/', "%2F");
-        }
+        let Some(path) = rest.split_once('/').map(|(_, p)| p) else {
+            return Err(Error::usage(format!(
+                "{s} is a hostname, not a project path; use owner/repo (or a full URL with a path)"
+            )));
+        };
+        // Same `.git` rule as remote parsing: strip one terminal
+        // `repo.git` suffix, keep repeated or non-terminal ones.
+        return Ok(crate::git::clean_path(path).replace('/', "%2F"));
     }
     // Keep any existing %2F encoding intact.
-    s.replace('/', "%2F")
+    Ok(s.replace('/', "%2F"))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn list(
     root: &Root,
-    assignee: &Option<String>,
-    reviewer: &Option<String>,
-    author: &Option<String>,
-    state: &Option<String>,
-    per_page: u32,
-    page: Option<u32>,
-    paginate: bool,
+    assignee: Option<&String>,
+    reviewer: Option<&String>,
+    author: Option<&String>,
+    state: Option<&String>,
+    opts: &ListOpts,
 ) -> Result<(), Error> {
+    let per_page = opts.per_page;
+    let page = opts.page;
+    let paginate = opts.paginate;
     let pp = project_path(root)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut query: Vec<(String, String)> = vec![("per_page".into(), per_page.to_string())];
     if let Some(a) = assignee {
         if a == "@me" {
-            if ctx.can_resolve_current_user() {
-                query.push(("assignee_id".into(), helpers::my_id(&ctx)?.to_string()));
-            } else {
-                return Err(helpers::at_me_needs_personal_token("--assignee"));
-            }
+            query.push((
+                "assignee_id".into(),
+                helpers::user_flag_id(&ctx, a, "--assignee")?.to_string(),
+            ));
         } else {
             query.push((
                 "assignee_username".into(),
@@ -148,11 +169,10 @@ fn list(
     }
     if let Some(r) = reviewer {
         if r == "@me" {
-            if ctx.can_resolve_current_user() {
-                query.push(("reviewer_id".into(), helpers::my_id(&ctx)?.to_string()));
-            } else {
-                return Err(helpers::at_me_needs_personal_token("--reviewer"));
-            }
+            query.push((
+                "reviewer_id".into(),
+                helpers::user_flag_id(&ctx, r, "--reviewer")?.to_string(),
+            ));
         } else {
             query.push((
                 "reviewer_username".into(),
@@ -162,11 +182,10 @@ fn list(
     }
     if let Some(a) = author {
         if a == "@me" {
-            if ctx.can_resolve_current_user() {
-                query.push(("author_id".into(), helpers::my_id(&ctx)?.to_string()));
-            } else {
-                return Err(helpers::at_me_needs_personal_token("--author"));
-            }
+            query.push((
+                "author_id".into(),
+                helpers::user_flag_id(&ctx, a, "--author")?.to_string(),
+            ));
         } else {
             query.push((
                 "author_username".into(),
@@ -177,15 +196,16 @@ fn list(
     if let Some(s) = state {
         query.push(("state".into(), s.clone()));
     }
+    // Pushed unconditionally: honored as the start page under --paginate
+    // (get_paginated dedups it) and as the single page otherwise.
+    if let Some(p) = page {
+        query.push(("page".into(), p.to_string()));
+    }
     let path = format!("projects/{pp}/merge_requests");
     let items: Vec<Value> = if paginate {
         ctx.client().get_paginated(&path, &query, None)?
     } else {
-        let mut q = query;
-        if let Some(p) = page {
-            q.push(("page".into(), p.to_string()));
-        }
-        ctx.client().get_json_vec(&path, &q)?
+        ctx.client().get_json_vec(&path, &query)?
     };
     crate::render::table::render_list(
         &items,
@@ -202,25 +222,48 @@ fn list(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn create(
-    root: &Root,
-    title: &Option<String>,
-    description: &Option<String>,
-    description_file: &Option<String>,
-    source_branch: &Option<String>,
-    target_branch: &Option<String>,
+/// Everything `mr create` needs, in one struct so the function signature
+/// stays readable (and clippy's `too_many_arguments` stays quiet honestly).
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "flags mirror the CLI surface 1:1; a state machine would obscure them"
+)]
+struct CreateParams<'a> {
+    title: &'a Option<String>,
+    description: &'a Option<String>,
+    description_file: &'a Option<String>,
+    source_branch: &'a Option<String>,
+    target_branch: &'a Option<String>,
     draft: bool,
-    assignee: &Option<String>,
-    reviewer: &Option<String>,
-    milestone: &Option<String>,
-    labels: &Option<String>,
+    assignee: &'a Option<String>,
+    reviewer: &'a Option<String>,
+    milestone: &'a Option<String>,
+    labels: &'a Option<String>,
     fill: bool,
     push: bool,
     squash: bool,
     remove_source_branch: bool,
     web: bool,
-) -> Result<(), Error> {
+}
+
+fn create(root: &Root, p: &CreateParams) -> Result<(), Error> {
+    let CreateParams {
+        title,
+        description,
+        description_file,
+        source_branch,
+        target_branch,
+        draft,
+        assignee,
+        reviewer,
+        milestone,
+        labels,
+        fill,
+        push,
+        squash,
+        remove_source_branch,
+        web,
+    } = p;
     let pp = project_path(root)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
 
@@ -231,7 +274,7 @@ fn create(
         Some(b) => b.clone(),
         None => current_branch()?,
     };
-    if push {
+    if *push {
         let here = current_branch()?;
         if here != source {
             return Err(Error::usage(format!(
@@ -241,32 +284,36 @@ fn create(
         run_git_push(&source)?;
     }
 
-    let target = match target_branch.clone() {
-        Some(t) => t,
+    let target = match target_branch.as_deref() {
+        Some(t) => t.to_string(),
         None => default_branch(&ctx, &pp)?,
     };
 
-    // Autodetect title/description from commits when --fill.
-    let (mut title, mut description) = match (title, description_file, description) {
-        (Some(t), _, _) => (t.clone(), description.clone().unwrap_or_default()),
-        (_, Some(f), _) => {
-            let d = crate::render::pager::read_input(f)?;
-            (
-                title
-                    .clone()
-                    .unwrap_or_else(|| fallback_title(&source, &target)),
-                d,
-            )
+    // Fill provenance is decided before any fallback: explicit flags win over
+    // --fill, and --fill only fills what the user did not provide. A provided
+    // --description-file is explicit provenance even if it turns out empty
+    // (an empty file means "no description", not "not provided"), so the fill
+    // fallback must not override it.
+    let explicit_title = title.is_some();
+    let explicit_description = description.is_some() || description_file.is_some();
+    let (mut title, mut description) = resolve_title_and_description(
+        title.as_ref(),
+        description_file.as_ref(),
+        description.as_ref(),
+        &source,
+        &target,
+    )?;
+    // --fill with nothing left to fill skips the git log spawn entirely.
+    if *fill && (!explicit_title || !explicit_description) {
+        let (ft, fd) = fill_from_commits(&source, &target);
+        if !explicit_title {
+            title = ft;
         }
-        (None, None, Some(d)) => (fallback_title(&source, &target), d.clone()),
-        (None, None, None) => (fallback_title(&source, &target), String::new()),
-    };
-    if fill {
-        let (ft, fd) = fill_from_commits(&source, &target)?;
-        title = ft;
-        description = fd;
+        if !explicit_description {
+            description = fd;
+        }
     }
-    if draft && !title.to_lowercase().starts_with("draft:") {
+    if *draft && !title.to_lowercase().starts_with("draft:") {
         title = format!("Draft: {title}");
     }
 
@@ -277,22 +324,10 @@ fn create(
         "description": description,
     });
     if let Some(a) = assignee {
-        if a != "@me" {
-            body["assignee_ids"] = json!([helpers::user_id(&ctx, a)?]);
-        } else if ctx.can_resolve_current_user() {
-            body["assignee_ids"] = json!([helpers::my_id(&ctx)?]);
-        } else {
-            return Err(helpers::at_me_needs_personal_token("--assignee"));
-        }
+        body["assignee_ids"] = json!([helpers::user_flag_id(&ctx, a, "--assignee")?]);
     }
     if let Some(r) = reviewer {
-        if r != "@me" {
-            body["reviewer_ids"] = json!([helpers::user_id(&ctx, r)?]);
-        } else if ctx.can_resolve_current_user() {
-            body["reviewer_ids"] = json!([helpers::my_id(&ctx)?]);
-        } else {
-            return Err(helpers::at_me_needs_personal_token("--reviewer"));
-        }
+        body["reviewer_ids"] = json!([helpers::user_flag_id(&ctx, r, "--reviewer")?]);
     }
     if let Some(m) = milestone {
         let mid = helpers::milestone_id(&ctx, &pp, m)?;
@@ -303,10 +338,10 @@ fn create(
     }
     // GitLab accepts these at MR creation time; previously the flags were
     // parsed and silently dropped.
-    if squash {
+    if *squash {
         body["squash"] = json!(true);
     }
-    if remove_source_branch {
+    if *remove_source_branch {
         body["remove_source_branch"] = json!(true);
     }
 
@@ -316,7 +351,7 @@ fn create(
         &[],
         Some(body),
     )?;
-    if web {
+    if *web {
         let web_url = mr.get("web_url").and_then(|v| v.as_str()).unwrap_or("");
         if !web_url.is_empty() {
             crate::cmd::repo::open_browser(web_url)?;
@@ -373,7 +408,7 @@ fn diff(root: &Root, iid: u64) -> Result<(), Error> {
     for d in diffs {
         let old = d.get("old_path").and_then(|v| v.as_str()).unwrap_or("");
         let new = d.get("new_path").and_then(|v| v.as_str()).unwrap_or("");
-        out.push_str(&format!("diff --git a/{old} b/{new}\n"));
+        let _ = writeln!(out, "diff --git a/{old} b/{new}");
         if let Some(diff) = d.get("diff").and_then(|v| v.as_str()) {
             out.push_str(diff);
             if !diff.ends_with('\n') {
@@ -434,11 +469,12 @@ fn merge(
 fn set_state(root: &Root, iid: u64, event: &str) -> Result<(), Error> {
     let pp = project_path(root)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
+    // state_event belongs in the body, like every other mutation.
     let mr: Value = ctx.client().send_json_value(
         "PUT",
         &format!("projects/{pp}/merge_requests/{iid}"),
-        &[("state_event".into(), event.to_string())],
-        None,
+        &[],
+        Some(json!({ "state_event": event })),
     )?;
     crate::render::table::render_one(&mr, &["iid", "title", "state"], ctx.json)?;
     Ok(())
@@ -447,8 +483,8 @@ fn set_state(root: &Root, iid: u64, event: &str) -> Result<(), Error> {
 fn comment(
     root: &Root,
     iid: u64,
-    body: &Option<String>,
-    body_file: &Option<String>,
+    body: Option<&String>,
+    body_file: Option<&String>,
 ) -> Result<(), Error> {
     let pp = project_path(root)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
@@ -491,17 +527,25 @@ fn ready(root: &Root, iid: u64) -> Result<(), Error> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn update(
-    root: &Root,
-    iid: u64,
-    title: &Option<String>,
-    description: &Option<String>,
-    assignee: &Option<String>,
-    reviewer: &Option<String>,
-    milestone: &Option<String>,
-    labels: &Option<String>,
-) -> Result<(), Error> {
+/// Everything `mr update` needs, in one struct (mirrors `CreateParams`).
+struct UpdateParams<'a> {
+    title: &'a Option<String>,
+    description: &'a Option<String>,
+    assignee: &'a Option<String>,
+    reviewer: &'a Option<String>,
+    milestone: &'a Option<String>,
+    labels: &'a Option<String>,
+}
+
+fn update(root: &Root, iid: u64, p: &UpdateParams) -> Result<(), Error> {
+    let UpdateParams {
+        title,
+        description,
+        assignee,
+        reviewer,
+        milestone,
+        labels,
+    } = p;
     let pp = project_path(root)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut body = serde_json::Map::new();
@@ -512,22 +556,16 @@ fn update(
         body.insert("description".into(), json!(d));
     }
     if let Some(a) = assignee {
-        if a != "@me" {
-            body.insert("assignee_ids".into(), json!([helpers::user_id(&ctx, a)?]));
-        } else if ctx.can_resolve_current_user() {
-            body.insert("assignee_ids".into(), json!([helpers::my_id(&ctx)?]));
-        } else {
-            return Err(helpers::at_me_needs_personal_token("--assignee"));
-        }
+        body.insert(
+            "assignee_ids".into(),
+            json!([helpers::user_flag_id(&ctx, a, "--assignee")?]),
+        );
     }
     if let Some(r) = reviewer {
-        if r != "@me" {
-            body.insert("reviewer_ids".into(), json!([helpers::user_id(&ctx, r)?]));
-        } else if ctx.can_resolve_current_user() {
-            body.insert("reviewer_ids".into(), json!([helpers::my_id(&ctx)?]));
-        } else {
-            return Err(helpers::at_me_needs_personal_token("--reviewer"));
-        }
+        body.insert(
+            "reviewer_ids".into(),
+            json!([helpers::user_flag_id(&ctx, r, "--reviewer")?]),
+        );
     }
     if let Some(m) = milestone {
         body.insert(
@@ -572,6 +610,44 @@ fn fallback_title(source: &str, target: &str) -> String {
     format!("{source} into {target}")
 }
 
+/// Decide the MR title and description: explicit flags win over `--fill`, and
+/// `--fill` only fills what the user did not provide. A provided
+/// `--description-file` is explicit provenance even if it turns out empty (an
+/// empty file means "no description", not "not provided"), so the fill
+/// fallback must not override it.
+fn resolve_title_and_description(
+    title: Option<&String>,
+    description_file: Option<&String>,
+    description: Option<&String>,
+    source: &str,
+    target: &str,
+) -> Result<(String, String), Error> {
+    match (
+        title.map(String::as_str),
+        description_file,
+        description.map(String::as_str),
+    ) {
+        (Some(t), _, _) => Ok((
+            t.to_string(),
+            description
+                .map(String::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        )),
+        (_, Some(f), _) => {
+            let d = crate::render::pager::read_input(f)?;
+            Ok((
+                title
+                    .map(String::as_str)
+                    .map_or_else(|| fallback_title(source, target), str::to_string),
+                d,
+            ))
+        }
+        (None, None, Some(d)) => Ok((fallback_title(source, target), d.to_string())),
+        (None, None, None) => Ok((fallback_title(source, target), String::new())),
+    }
+}
+
 /// Strip the draft/WIP prefix the way GitLab itself recognizes it
 /// (`Draft:`, `WIP:`, `[Draft]`, `(WIP)` — case-insensitive, any casing of
 /// the label). Slicing goes through `str::get` so multi-byte titles
@@ -589,9 +665,12 @@ fn strip_draft_prefix(title: &str) -> String {
     title.to_string()
 }
 
-fn fill_from_commits(source: &str, target: &str) -> Result<(String, String), Error> {
-    // Try origin/<target>..origin/<source>, falling back to the local branch
-    // range (fresh clones of new branches may not have origin/<source> yet).
+/// Collect the commit subjects/bodies feeding the MR as (title, description).
+///
+/// Tries `origin/<target>..origin/<source>`, falling back to the local branch
+/// range (fresh clones of new branches may not have origin/<source> yet).
+/// Returns `"Update branch"` with an empty description when git has nothing.
+fn fill_from_commits(source: &str, target: &str) -> (String, String) {
     let remote_range = format!("origin/{target}..origin/{source}");
     let local_range = format!("{target}..{source}");
     let log = crate::git::run_git(&["log", "--pretty=format:%s%n%b", &remote_range])
@@ -600,7 +679,7 @@ fn fill_from_commits(source: &str, target: &str) -> Result<(String, String), Err
     let mut lines = log.lines();
     let title = lines.next().unwrap_or("Update branch").to_string();
     let body: String = lines.collect::<Vec<_>>().join("\n").trim().to_string();
-    Ok((title, body))
+    (title, body)
 }
 
 fn default_branch(ctx: &crate::cmd::Ctx, pp: &str) -> Result<String, Error> {
@@ -620,17 +699,22 @@ mod tests {
 
     #[test]
     fn encode_project_path_variants() {
-        assert_eq!(encode_project_path("group/proj"), "group%2Fproj");
+        assert_eq!(encode_project_path("group/proj").unwrap(), "group%2Fproj");
         assert_eq!(
-            encode_project_path("/group/sub/proj/"),
+            encode_project_path("/group/sub/proj/").unwrap(),
             "group%2Fsub%2Fproj"
         );
-        assert_eq!(encode_project_path("group%2Fproj"), "group%2Fproj");
+        assert_eq!(encode_project_path("group%2Fproj").unwrap(), "group%2Fproj");
         assert_eq!(
-            encode_project_path("https://gitlab.com/group/sub/proj.git"),
+            encode_project_path("https://gitlab.com/group/sub/proj.git").unwrap(),
             "group%2Fsub%2Fproj"
         );
-        assert_eq!(encode_project_path("42"), "42");
+        assert_eq!(encode_project_path("42").unwrap(), "42");
+        // A bare URL has no project path: usage error, not a nonsense
+        // encoding like `https:%2F%2Fgitlab.com`.
+        let err = encode_project_path("https://gitlab.com").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("hostname, not a project path"));
     }
 
     #[test]

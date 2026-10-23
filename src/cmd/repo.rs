@@ -5,15 +5,18 @@ use crate::cli::Root;
 use crate::cmd::resolve;
 use crate::error::Error;
 
+/// Run one `repo` subcommand.
+///
+/// # Errors
+///
+/// Returns [`Error`] when the request fails or git/browser spawning fails.
 pub fn run(root: &Root, args: &RepoArgs) -> Result<(), Error> {
     match args {
         RepoArgs::View { target, web } => view(root, target.as_deref(), *web),
         RepoArgs::List {
             group,
-            per_page,
-            page,
-            paginate,
-        } => list(root, group.as_deref(), *per_page, *page, *paginate),
+            list: list_opts,
+        } => list(root, group.as_deref(), list_opts),
         RepoArgs::Clone { target, dir } => clone(root, target, dir.as_deref()),
     }
 }
@@ -21,10 +24,10 @@ pub fn run(root: &Root, args: &RepoArgs) -> Result<(), Error> {
 /// Resolve project target: explicit > --repo/-R > git remote.
 fn project_path(root: &Root, target: Option<&str>) -> Result<String, Error> {
     if let Some(t) = target {
-        return Ok(super::mr::encode_project_path(t));
+        return super::mr::encode_project_path(t);
     }
     if let Some(r) = &root.repo {
-        return Ok(super::mr::encode_project_path(r));
+        return super::mr::encode_project_path(r);
     }
     let remote = crate::git::detect_remote()?;
     Ok(remote.project_path.replace('/', "%2F"))
@@ -35,7 +38,9 @@ fn view(root: &Root, target: Option<&str>, web: bool) -> Result<(), Error> {
     let ctx = resolve(root, root.hostname.as_deref())?;
     if web {
         // Prefer the web_url returned by the API (handles path-prefixed
-        // instances correctly); fall back to the derived base.
+        // instances correctly); fall back to base + encoded path (the
+        // project home route). If the API call failed, the fallback is still
+        // a real URL instead of a guaranteed 404.
         let url =
             if let Ok(project) = ctx.client().get_json_value(&format!("projects/{pp}"), &[]) {
                 project
@@ -45,10 +50,7 @@ fn view(root: &Root, target: Option<&str>, web: bool) -> Result<(), Error> {
             } else {
                 None
             }
-            .unwrap_or_else(|| {
-                let p = pp.replace("%2F", "/");
-                format!("{}/-/project/{p}", ctx.web_url)
-            });
+            .unwrap_or_else(|| format!("{}/{}", ctx.web_url, pp.replace("%2F", "/")));
         open_browser(&url)?;
         return Ok(());
     }
@@ -70,13 +72,10 @@ fn view(root: &Root, target: Option<&str>, web: bool) -> Result<(), Error> {
     Ok(())
 }
 
-fn list(
-    root: &Root,
-    group: Option<&str>,
-    per_page: u32,
-    page: Option<u32>,
-    paginate: bool,
-) -> Result<(), Error> {
+fn list(root: &Root, group: Option<&str>, opts: &crate::cli::ListOpts) -> Result<(), Error> {
+    let per_page = opts.per_page;
+    let page = opts.page;
+    let paginate = opts.paginate;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut query: Vec<(String, String)> = vec![
         ("per_page".into(), per_page.to_string()),
@@ -84,7 +83,7 @@ fn list(
     ];
     let path = match group {
         Some(g) => {
-            let g_enc = super::mr::encode_project_path(g);
+            let g_enc = super::mr::encode_project_path(g)?;
             query.push(("include_subgroups".into(), "true".into()));
             format!("groups/{g_enc}/projects")
         }
@@ -134,6 +133,10 @@ fn clone(root: &Root, target: &str, dir: Option<&str>) -> Result<(), Error> {
 }
 
 /// Open a URL in the browser ($BROWSER > xdg-open).
+///
+/// # Errors
+///
+/// Returns [`Error`] when the browser cannot be spawned or exits nonzero.
 pub fn open_browser(url: &str) -> Result<(), Error> {
     let browser = std::env::var("BROWSER").unwrap_or_else(|_| "xdg-open".to_string());
     let status = std::process::Command::new(browser)

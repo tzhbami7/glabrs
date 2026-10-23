@@ -110,8 +110,10 @@ fn write_response(
     headers: &[(String, String)],
     body: &[u8],
 ) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+    // Statuses other than these never occur in these tests; "OK" keeps the
+    // response well-formed for ureq regardless.
     let reason = match status {
-        200 => "OK",
         204 => "No Content",
         401 => "Unauthorized",
         404 => "Not Found",
@@ -119,9 +121,9 @@ fn write_response(
     };
     let mut resp = format!("HTTP/1.1 {status} {reason}\r\n");
     for (k, v) in headers {
-        resp.push_str(&format!("{k}: {v}\r\n"));
+        let _ = write!(resp, "{k}: {v}\r\n");
     }
-    resp.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    let _ = write!(resp, "Content-Length: {}\r\n", body.len());
     resp.push_str("Connection: close\r\n\r\n");
     stream.write_all(resp.as_bytes())?;
     stream.write_all(body)?;
@@ -285,6 +287,45 @@ fn pagination_cap_ignores_runaway_server() {
     let c = client_for(&base, None);
     let items = c.get_paginated("projects/1/issues", &[], Some(3)).unwrap();
     assert_eq!(items.len(), 300);
+}
+
+#[test]
+fn pagination_honors_caller_page_as_start_page() {
+    // A caller-supplied page must be the start page, sent exactly once. The
+    // old behavior pushed page=<caller> next to the loop's own page=<n>,
+    // making the effective start page server-dependent.
+    let (base, rx) = spawn_server(|req| {
+        // Page 2: 2 items + X-Next-Page: 3. Page 3: 1 item, last.
+        if req.path.contains("page=2&per_page=") {
+            (
+                200,
+                vec![("X-Next-Page".to_string(), "3".to_string())],
+                array_page(2),
+            )
+        } else {
+            (200, vec![], array_page(1))
+        }
+    });
+    let c = client_for(&base, None);
+    let items = c
+        .get_paginated(
+            "projects/1/issues",
+            &[("page".to_string(), "2".to_string())],
+            None,
+        )
+        .unwrap();
+    assert_eq!(items.len(), 3);
+    let first = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    let second = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    // Start page sent exactly once, then the loop advances from there.
+    assert!(first.path.contains("page=2&per_page="), "{}", first.path);
+    assert!(
+        !first.path.contains("page=2&page="),
+        "duplicate page parameter: {}",
+        first.path
+    );
+    assert_eq!(first.path.matches("page=2").count(), 1);
+    assert!(second.path.contains("page=3"), "{}", second.path);
 }
 
 #[test]
