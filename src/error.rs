@@ -89,6 +89,12 @@ impl From<ureq::Error> for Error {
             ureq::Error::Status(code, _) if *code == 401 => {
                 Error::auth("HTTP 401 Unauthorized: token missing, invalid, or insufficient")
             }
+            // 404 is the "not found" contract (exit 4, README): a typo'd IID,
+            // a missing release, a job that does not exist — scripts must be
+            // able to tell that apart from a network/runtime failure.
+            ureq::Error::Status(code, _) if *code == 404 => {
+                Error::not_found("HTTP 404 Not Found: no such resource on this instance")
+            }
             _ => Error::runtime(format!("HTTP error: {e}")),
         }
     }
@@ -136,9 +142,10 @@ mod tests {
     }
 
     #[test]
-    fn http_401_maps_to_auth_and_other_statuses_to_runtime() {
-        // 401 is an auth failure (exit 3); every other HTTP error is runtime
-        // (exit 1). Built from real ureq::Error values.
+    fn http_401_404_map_to_auth_not_found_and_rest_to_runtime() {
+        // 401 is an auth failure (exit 3), 404 the not-found contract (exit 4,
+        // README); every other HTTP error is runtime (exit 1). Built from real
+        // ureq::Error values.
         let unauthorized =
             ureq::Error::Status(401, ureq::Response::new(401, "Unauthorized", "").unwrap());
         let err = Error::from(unauthorized);
@@ -151,6 +158,15 @@ mod tests {
         let not_found =
             ureq::Error::Status(404, ureq::Response::new(404, "Not Found", "").unwrap());
         let err = Error::from(not_found);
+        assert_eq!(err.exit_code(), 4);
+        assert_eq!(
+            err.to_string(),
+            "HTTP 404 Not Found: no such resource on this instance"
+        );
+
+        let server_error =
+            ureq::Error::Status(500, ureq::Response::new(500, "Server Error", "").unwrap());
+        let err = Error::from(server_error);
         assert_eq!(err.exit_code(), 1);
         assert!(err.to_string().starts_with("HTTP error: "));
     }

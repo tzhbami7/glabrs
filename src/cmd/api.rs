@@ -71,7 +71,7 @@ pub fn run(root: &Root, args: &ApiArgs) -> Result<(), Error> {
     } else {
         let value = ctx
             .client()
-            .send_json_value(&args.method, &path, &query, body)?;
+            .send_json_value(&args.method, &path, &query, body.as_ref())?;
         // 204 No Content and other empty responses decode to null; report a
         // small sentinel so `jq` gets valid JSON on stdout.
         if value.is_null() {

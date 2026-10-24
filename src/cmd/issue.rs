@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use serde_json::{json, Value};
 
 use crate::cli::issue_cmd::IssueArgs;
@@ -10,7 +12,8 @@ use crate::error::Error;
 ///
 /// # Errors
 ///
-/// Returns [`Error`] when the request fails or a body file cannot be read.
+/// Returns [`Error`] when the request or a body file read fails;
+/// `delete` without `--yes` is a usage error in non-interactive sessions.
 pub fn run(root: &Root, args: &IssueArgs) -> Result<(), Error> {
     match args {
         IssueArgs::List {
@@ -69,7 +72,7 @@ fn list(
     let per_page = opts.per_page;
     let page = opts.page;
     let paginate = opts.paginate;
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut query: Vec<(String, String)> = vec![("per_page".into(), per_page.to_string())];
     if let Some(a) = assignee {
@@ -140,13 +143,11 @@ fn create(
     milestone: Option<&String>,
     assignee: Option<&String>,
 ) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut body = json!({ "title": title });
-    if let Some(d) = description_file {
-        body["description"] = Value::String(crate::render::pager::read_input(d)?);
-    } else if let Some(d) = description {
-        body["description"] = Value::String(d.clone());
+    if let Some(d) = helpers::description_text(description, description_file)? {
+        body["description"] = Value::String(d);
     }
     if let Some(l) = labels {
         body["labels"] = Value::String(l.clone());
@@ -162,13 +163,13 @@ fn create(
     }
     let issue: Value =
         ctx.client()
-            .send_json_value("POST", &format!("projects/{pp}/issues"), &[], Some(body))?;
+            .send_json_value("POST", &format!("projects/{pp}/issues"), &[], Some(&body))?;
     crate::render::table::render_one(&issue, &["iid", "title", "web_url"], ctx.json)?;
     Ok(())
 }
 
 fn view(root: &Root, iid: u64, web: bool) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     if web {
         let project: Value = ctx
@@ -204,14 +205,14 @@ fn view(root: &Root, iid: u64, web: bool) -> Result<(), Error> {
 }
 
 fn set_state(root: &Root, iid: u64, event: &str) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     // state_event belongs in the body, like every other mutation.
     let issue: Value = ctx.client().send_json_value(
         "PUT",
         &format!("projects/{pp}/issues/{iid}"),
         &[],
-        Some(json!({ "state_event": event })),
+        Some(&json!({ "state_event": event })),
     )?;
     crate::render::table::render_one(&issue, &["iid", "title", "state"], ctx.json)?;
     Ok(())
@@ -223,35 +224,39 @@ fn comment(
     body: Option<&String>,
     body_file: Option<&String>,
 ) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
-    let text = match body_file {
-        Some(p) => crate::render::pager::read_input(p)?,
-        None => match body {
-            Some(b) => b.clone(),
-            None => return Err(Error::usage("comment requires --body or --body-file")),
-        },
-    };
+    let text = helpers::comment_text(body, body_file)?;
     let note: Value = ctx.client().send_json_value(
         "POST",
         &format!("projects/{pp}/issues/{iid}/notes"),
         &[],
-        Some(json!({ "body": text })),
+        Some(&json!({ "body": text })),
     )?;
     crate::render::table::render_one(&note, &["id", "body"], ctx.json)?;
     Ok(())
 }
 
 fn delete(root: &Root, iid: u64, yes: bool) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    // Resolve the target before asking: a usage error (wrong host, no -R)
+    // must surface before the user confirms anything.
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     if !yes {
+        // Non-interactive stdin (CI, piped scripts) answers EOF to a prompt:
+        // refusing up front keeps "aborted" from looking like success (exit 0)
+        // to scripts keyed on the exit code.
+        if !std::io::stdin().is_terminal() {
+            return Err(Error::usage(
+                "refusing to delete without --yes in a non-interactive session",
+            ));
+        }
         eprint!("Delete issue #{iid}? [y/N] ");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
         if !line.trim().eq_ignore_ascii_case("y") {
             println!("aborted");
-            return Ok(());
+            return Err(Error::usage("aborted by user"));
         }
     }
     ctx.client()

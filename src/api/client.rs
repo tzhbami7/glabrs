@@ -10,6 +10,11 @@ use crate::error::Error;
 /// cannot make the client loop forever.
 const MAX_PAGES_DEFAULT: u32 = 10_000;
 
+/// Longest `Retry-After` sleep accepted on HTTP 429: anything above this is
+/// treated as "the instance is throttling hard" and surfaces as an error
+/// instead of silently hanging the command for minutes.
+const MAX_RETRY_AFTER_SECS: u64 = 60;
+
 /// How the token is presented to the API.
 ///
 /// Personal access tokens use `PRIVATE-TOKEN`; CI job tokens must use
@@ -137,7 +142,7 @@ impl Client {
             q[page_idx].1 = page.to_string();
             let url = self.url(path, &q);
             self.verbose_log("GET", path);
-            let resp = self.apply_auth(self.agent.get(&url)).call()?;
+            let resp = Self::send_with_retry(self.apply_auth(self.agent.get(&url)))?;
             let next_page = resp
                 .header("X-Next-Page")
                 .and_then(|v| v.trim().parse::<u32>().ok());
@@ -196,7 +201,7 @@ impl Client {
     pub fn get_json_value(&self, path: &str, query: &[(String, String)]) -> Result<Value, Error> {
         let url = self.url(path, query);
         self.verbose_log("GET", path);
-        let resp = self.apply_auth(self.agent.get(&url)).call()?;
+        let resp = Self::send_with_retry(self.apply_auth(self.agent.get(&url)))?;
         decode_json(resp)
     }
 
@@ -223,6 +228,20 @@ impl Client {
         Ok(self.apply_auth(self.agent.get(url)))
     }
 
+    /// GET a URL and return the raw body bytes (traces, downloads), with the
+    /// same auth, per-host headers, and 429 retry as the JSON getters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when the request fails or the body cannot be read.
+    pub fn get_bytes(&self, url: &str) -> Result<Vec<u8>, Error> {
+        let req = self.apply_auth(self.agent.get(url));
+        let resp = Self::send_with_retry(req)?;
+        let mut buf = Vec::new();
+        resp.into_reader().read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+
     /// Raw POST returning a request (for multipart uploads).
     ///
     /// # Errors
@@ -245,7 +264,7 @@ impl Client {
         method: &str,
         path: &str,
         query: &[(String, String)],
-        body: Option<Value>,
+        body: Option<&Value>,
     ) -> Result<Value, Error> {
         let url = self.url(path, query);
         self.verbose_log(method, path);
@@ -253,20 +272,28 @@ impl Client {
             "GET" => self.agent.get(&url),
             "POST" => self.agent.post(&url),
             "PUT" => self.agent.put(&url),
+            "PATCH" => self.agent.patch(&url),
             "DELETE" => self.agent.delete(&url),
             _ => return Err(Error::usage(format!("unsupported method {method}"))),
         };
         let req = self.apply_auth(req);
-        let resp = match body {
-            Some(b) => req.send_json(b)?,
-            // Send an explicit empty JSON object: ureq's `call()` would inherit
-            // the application/json content-type from `send_json` elsewhere in
-            // the chain while carrying no payload, which stricter servers and
-            // reverse proxies reject — and `send_string` alone would set
-            // text/plain.
-            None => req
-                .set("Content-Type", "application/json")
-                .send_string("{}")?,
+        // With no body, send an explicit empty JSON object: ureq's plain
+        // `call()` would carry no payload at all, which stricter servers and
+        // reverse proxies reject, and `send_string` alone would set
+        // text/plain. `send_json(&{})` is byte-identical to the explicit
+        // Content-Type + "{}" dance it replaces. Built once, borrowed for
+        // both the first attempt and a possible retry.
+        let empty = Value::Object(serde_json::Map::new());
+        let payload = body.unwrap_or(&empty);
+        // A 429 response was never processed by the server, so replaying the
+        // request once is safe for every method (`ureq::Request` is Clone, so
+        // the second attempt carries the same headers and body).
+        let resp = match req.clone().send_json(payload.clone()) {
+            Err(ureq::Error::Status(429, r)) => {
+                Self::sleep_retry_after(&r);
+                req.send_json(payload.clone())?
+            }
+            other => other?,
         };
         decode_json(resp)
     }
@@ -305,6 +332,33 @@ impl Client {
         req
     }
 
+    /// Run a fully prepared GET request, honoring a single `Retry-After` on
+    /// HTTP 429.
+    ///
+    /// A 429 response was never processed by the server, so replaying the
+    /// request once is safe for every method. A second 429 (or any other
+    /// error) is returned to the caller unchanged.
+    fn send_with_retry(req: ureq::Request) -> Result<ureq::Response, Error> {
+        match req.clone().call() {
+            Err(ureq::Error::Status(429, resp)) => {
+                Self::sleep_retry_after(&resp);
+                Ok(req.call()?)
+            }
+            other => Ok(other?),
+        }
+    }
+
+    /// Sleep out a 429's `Retry-After` (capped at
+    /// [`MAX_RETRY_AFTER_SECS`]; default 5s when the header is absent).
+    fn sleep_retry_after(resp: &ureq::Response) {
+        let secs = resp
+            .header("Retry-After")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(5, |s| s.min(MAX_RETRY_AFTER_SECS));
+        eprintln!("api: rate limited (HTTP 429), retrying once in {secs}s per Retry-After");
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+    }
+
     fn verbose_log(&self, method: &str, path: &str) {
         if self.verbose {
             eprintln!("api: {method} {path}");
@@ -340,11 +394,17 @@ pub fn decode_json(resp: ureq::Response) -> Result<Value, Error> {
     Ok(serde_json::from_str(&text)?)
 }
 
-/// Extract the hostname from an API URL, if parseable.
+/// Extract the canonical hostname from an API URL, if parseable.
+///
+/// Canonical like every host source (see
+/// [`crate::git::canonical_host`]): lowercased, default ports dropped,
+/// trailing FQDN dot trimmed — so a `CI_API_V4_URL` of
+/// `https://GitLab.Corp.Example:443` resolves to the same hosts.toml entry as
+/// `auth login --hostname gitlab.corp.example`.
 #[must_use]
 pub fn host_of_api_url(api_url: &str) -> Option<String> {
     let u = url::Url::parse(api_url).ok()?;
-    u.host_str().map(str::to_ascii_lowercase)
+    u.host_str().map(crate::git::canonical_host)
 }
 
 /// Reduce an API URL to the instance root:
@@ -506,5 +566,22 @@ mod tests {
             instance_root("http://gitlab.internal:8080/custom"),
             "http://gitlab.internal:8080"
         );
+    }
+
+    #[test]
+    fn host_of_api_url_is_canonical() {
+        // Same host, same entry — the url crate separates the port from
+        // host_str, and canonical_host trims the FQDN trailing dot the url
+        // crate preserves (a CI_API_V4_URL spelling that must still match the
+        // hosts.toml entry stored by auth login).
+        assert_eq!(
+            host_of_api_url("https://GitLab.Corp.Example:443/api/v4"),
+            Some("gitlab.corp.example".to_string())
+        );
+        assert_eq!(
+            host_of_api_url("http://h.internal.:8080/api/v4"),
+            Some("h.internal".to_string())
+        );
+        assert_eq!(host_of_api_url("not a url"), None);
     }
 }

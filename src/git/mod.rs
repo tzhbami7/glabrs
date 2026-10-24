@@ -7,7 +7,8 @@ use crate::error::Error;
 /// A parsed git remote URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Remote {
-    /// Remote hostname, lowercased source spelling preserved.
+    /// Canonical hostname (see [`canonical_host`]): lowercased, default ports
+    /// dropped, trailing FQDN dot trimmed.
     pub hostname: String,
     /// Project path with leading/trailing slashes and `.git` stripped.
     pub project_path: String,
@@ -15,10 +16,39 @@ pub struct Remote {
     pub port: Option<u16>,
 }
 
+/// Canonical form of a hostname: lowercased ASCII, default ports (443/80)
+/// dropped, FQDN trailing dot trimmed. This is the spelling every
+/// `hosts.toml` lookup and host comparison uses, so `git@GitLab.Corp.Example:`
+/// SCP remotes, `https://Host:443/...` checkouts, and
+/// `auth login --hostname gitlab.corp.example` all resolve to one entry.
+///
+/// (The `url` crate lowercases `https://`/`ssh://` hostnames itself; SCP-syntax
+/// remotes bypass it entirely, which is why this helper exists.)
+#[must_use]
+pub fn canonical_host(raw: &str) -> String {
+    let mut s = raw.trim().to_ascii_lowercase();
+    // Drop default ports (rsplit so IPv6 literals `[::1]:8443` survive).
+    if let Some((host, port)) = s.rsplit_once(':') {
+        let default_port = port == "443" || port == "80";
+        let looks_like_port =
+            !host.is_empty() && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit());
+        if looks_like_port && default_port {
+            s = host.to_string();
+        }
+    }
+    // `gitlab.example.` and `gitlab.example` are the same FQDN.
+    if s.ends_with('.') {
+        s.pop();
+    }
+    s
+}
+
 /// Parse a git remote URL into host + project path.
 ///
 /// Handles: `https://host[:port]/any/depth/owner/repo(.git)`,
 /// `ssh://git@host[:port]/...`, and `git@host:owner/repo.git` (SCP syntax).
+/// `hostname` is canonical (see [`canonical_host`]): lowercased, default
+/// ports dropped, trailing FQDN dot trimmed.
 ///
 /// The full path is kept: subgroup projects (`group/subgroup/proj`) must not
 /// lose their leading segments, and path-prefixed instances are resolved via
@@ -49,7 +79,7 @@ pub fn parse_remote(url: &str) -> Option<Remote> {
             }
             let path = path.trim_start_matches('/');
             return Some(Remote {
-                hostname: host,
+                hostname: canonical_host(&host),
                 project_path: clean_path(path),
                 port: None,
             });
@@ -63,16 +93,23 @@ pub fn parse_remote(url: &str) -> Option<Remote> {
         return None;
     }
     let port = parsed.port();
-    let path = parsed.path().trim_start_matches('/');
-    if path.is_empty() {
-        return None;
-    }
 
     Some(Remote {
-        hostname: host,
-        project_path: clean_path(path),
+        hostname: canonical_host(&host),
+        project_path: clean_path(path_from(&parsed)?),
         port,
     })
+}
+
+/// The URL path without its leading slash; `None` when empty (a bare
+/// `https://host` URL names no project).
+fn path_from(parsed: &url::Url) -> Option<&str> {
+    let path = parsed.path().trim_start_matches('/');
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 /// Strip surrounding slashes and a `.git` suffix only when it terminates the
@@ -159,6 +196,24 @@ mod tests {
         let r = parse_remote("git@gitlab.corp.example:group/subgroup/proj.git").unwrap();
         assert_eq!(r.hostname, "gitlab.corp.example");
         assert_eq!(r.project_path, "group/subgroup/proj");
+    }
+
+    #[test]
+    fn scp_syntax_host_is_canonicalized() {
+        // SCP URLs bypass the url crate, which lowercases https:// hosts;
+        // without canonicalization the raw spelling missed the lowercase
+        // hosts.toml entry stored by auth login and commands refused with a
+        // spurious -R hint.
+        let r = parse_remote("git@GitLab.Corp.Example:group/proj.git").unwrap();
+        assert_eq!(r.hostname, "gitlab.corp.example");
+        let r = parse_remote("git@host.example.:group/proj.git").unwrap();
+        assert_eq!(r.hostname, "host.example");
+    }
+
+    #[test]
+    fn trailing_fqdn_dot_is_trimmed_for_url_remotes_too() {
+        let r = parse_remote("https://gitlab.corp.example./group/proj.git").unwrap();
+        assert_eq!(r.hostname, "gitlab.corp.example");
     }
 
     #[test]

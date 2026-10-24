@@ -111,35 +111,6 @@ pub fn run(root: &Root, args: &MrArgs) -> Result<(), Error> {
     }
 }
 
-/// Encode an owner/name or owner/subgroup/name path for the API (`/` -> `%2F`),
-/// accepting an already-encoded path and a full URL.
-///
-/// A bare URL with no project path (`https://gitlab.com`) is a usage error:
-/// silently encoding it would send `https:%2F%2Fgitlab.com` to the API and
-/// surface as a confusing 404.
-///
-/// # Errors
-///
-/// Returns [`Error::Usage`] for a bare URL with no project path.
-pub fn encode_project_path(s: &str) -> Result<String, Error> {
-    let s = s.trim().trim_matches('/');
-    if let Some(rest) = s
-        .strip_prefix("https://")
-        .or_else(|| s.strip_prefix("http://"))
-    {
-        let Some(path) = rest.split_once('/').map(|(_, p)| p) else {
-            return Err(Error::usage(format!(
-                "{s} is a hostname, not a project path; use owner/repo (or a full URL with a path)"
-            )));
-        };
-        // Same `.git` rule as remote parsing: strip one terminal
-        // `repo.git` suffix, keep repeated or non-terminal ones.
-        return Ok(crate::git::clean_path(path).replace('/', "%2F"));
-    }
-    // Keep any existing %2F encoding intact.
-    Ok(s.replace('/', "%2F"))
-}
-
 fn list(
     root: &Root,
     assignee: Option<&String>,
@@ -151,7 +122,7 @@ fn list(
     let per_page = opts.per_page;
     let page = opts.page;
     let paginate = opts.paginate;
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut query: Vec<(String, String)> = vec![("per_page".into(), per_page.to_string())];
     if let Some(a) = assignee {
@@ -268,7 +239,7 @@ fn create(root: &Root, p: &CreateParams) -> Result<(), Error> {
         remove_source_branch,
         web,
     } = p;
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
 
     // Push the current branch first when asked. With an explicit
@@ -353,7 +324,7 @@ fn create(root: &Root, p: &CreateParams) -> Result<(), Error> {
         "POST",
         &format!("projects/{pp}/merge_requests"),
         &[],
-        Some(body),
+        Some(&body),
     )?;
     if *web {
         let web_url = mr.get("web_url").and_then(|v| v.as_str()).unwrap_or("");
@@ -367,7 +338,7 @@ fn create(root: &Root, p: &CreateParams) -> Result<(), Error> {
 }
 
 fn view(root: &Root, iid: u64, web: bool) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mr = fetch_mr(&ctx, &pp, iid)?;
     if web {
@@ -398,7 +369,7 @@ fn view(root: &Root, iid: u64, web: bool) -> Result<(), Error> {
 }
 
 fn diff(root: &Root, iid: u64) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let changes: Value = ctx
         .client()
@@ -429,7 +400,7 @@ fn diff(root: &Root, iid: u64) -> Result<(), Error> {
 }
 
 fn approve(root: &Root, iid: u64) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let resp: Value = ctx.client().send_json_value(
         "POST",
@@ -448,7 +419,7 @@ fn merge(
     remove_source_branch: bool,
     when_pipeline_succeeds: bool,
 ) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut body = serde_json::Map::new();
     if squash {
@@ -464,21 +435,21 @@ fn merge(
         "PUT",
         &format!("projects/{pp}/merge_requests/{iid}/merge"),
         &[],
-        Some(Value::Object(body)),
+        Some(&Value::Object(body)),
     )?;
     crate::render::table::render_one(&mr, &["iid", "title", "state"], ctx.json)?;
     Ok(())
 }
 
 fn set_state(root: &Root, iid: u64, event: &str) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     // state_event belongs in the body, like every other mutation.
     let mr: Value = ctx.client().send_json_value(
         "PUT",
         &format!("projects/{pp}/merge_requests/{iid}"),
         &[],
-        Some(json!({ "state_event": event })),
+        Some(&json!({ "state_event": event })),
     )?;
     crate::render::table::render_one(&mr, &["iid", "title", "state"], ctx.json)?;
     Ok(())
@@ -490,27 +461,21 @@ fn comment(
     body: Option<&String>,
     body_file: Option<&String>,
 ) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
-    let text = match body_file {
-        Some(p) => crate::render::pager::read_input(p)?,
-        None => match body {
-            Some(b) => b.clone(),
-            None => return Err(Error::usage("comment requires --body or --body-file")),
-        },
-    };
+    let text = helpers::comment_text(body, body_file)?;
     let note: Value = ctx.client().send_json_value(
         "POST",
         &format!("projects/{pp}/merge_requests/{iid}/notes"),
         &[],
-        Some(json!({ "body": text })),
+        Some(&json!({ "body": text })),
     )?;
     crate::render::table::render_one(&note, &["id", "body"], ctx.json)?;
     Ok(())
 }
 
 fn ready(root: &Root, iid: u64) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mr = fetch_mr(&ctx, &pp, iid)?;
     let title = mr.get("title").and_then(|v| v.as_str()).unwrap_or("");
@@ -525,7 +490,7 @@ fn ready(root: &Root, iid: u64) -> Result<(), Error> {
         "PUT",
         &format!("projects/{pp}/merge_requests/{iid}"),
         &[],
-        Some(json!({ "title": stripped })),
+        Some(&json!({ "title": stripped })),
     )?;
     crate::render::table::render_one(&updated, &["iid", "title", "state"], ctx.json)?;
     Ok(())
@@ -550,7 +515,7 @@ fn update(root: &Root, iid: u64, p: &UpdateParams) -> Result<(), Error> {
         milestone,
         labels,
     } = p;
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut body = serde_json::Map::new();
     if let Some(t) = title {
@@ -584,7 +549,7 @@ fn update(root: &Root, iid: u64, p: &UpdateParams) -> Result<(), Error> {
         "PUT",
         &format!("projects/{pp}/merge_requests/{iid}"),
         &[],
-        Some(Value::Object(body)),
+        Some(&Value::Object(body)),
     )?;
     crate::render::table::render_one(&mr, &["iid", "title", "state"], ctx.json)?;
     Ok(())
@@ -618,7 +583,8 @@ fn fallback_title(source: &str, target: &str) -> String {
 /// `--fill` only fills what the user did not provide. A provided
 /// `--description-file` is explicit provenance even if it turns out empty (an
 /// empty file means "no description", not "not provided"), so the fill
-/// fallback must not override it.
+/// fallback must not override it — and it is read even when `--title` is
+/// given: `--title X --description-file f` must not silently drop `f`.
 fn resolve_title_and_description(
     title: Option<&String>,
     description_file: Option<&String>,
@@ -626,30 +592,12 @@ fn resolve_title_and_description(
     source: &str,
     target: &str,
 ) -> Result<(String, String), Error> {
-    match (
-        title.map(String::as_str),
-        description_file,
-        description.map(String::as_str),
-    ) {
-        (Some(t), _, _) => Ok((
-            t.to_string(),
-            description
-                .map(String::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        )),
-        (_, Some(f), _) => {
-            let d = crate::render::pager::read_input(f)?;
-            Ok((
-                title
-                    .map(String::as_str)
-                    .map_or_else(|| fallback_title(source, target), str::to_string),
-                d,
-            ))
-        }
-        (None, None, Some(d)) => Ok((fallback_title(source, target), d.to_string())),
-        (None, None, None) => Ok((fallback_title(source, target), String::new())),
-    }
+    let description = helpers::description_text(description, description_file)?;
+    let title = match title {
+        Some(t) => t.clone(),
+        None => fallback_title(source, target),
+    };
+    Ok((title, description.unwrap_or_default()))
 }
 
 /// Strip the draft/WIP prefix the way GitLab itself recognizes it
@@ -702,23 +650,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encode_project_path_variants() {
-        assert_eq!(encode_project_path("group/proj").unwrap(), "group%2Fproj");
-        assert_eq!(
-            encode_project_path("/group/sub/proj/").unwrap(),
-            "group%2Fsub%2Fproj"
-        );
-        assert_eq!(encode_project_path("group%2Fproj").unwrap(), "group%2Fproj");
-        assert_eq!(
-            encode_project_path("https://gitlab.com/group/sub/proj.git").unwrap(),
-            "group%2Fsub%2Fproj"
-        );
-        assert_eq!(encode_project_path("42").unwrap(), "42");
-        // A bare URL has no project path: usage error, not a nonsense
-        // encoding like `https:%2F%2Fgitlab.com`.
-        let err = encode_project_path("https://gitlab.com").unwrap_err();
-        assert_eq!(err.exit_code(), 2);
-        assert!(err.to_string().contains("hostname, not a project path"));
+    fn fallback_title_format() {
+        assert_eq!(fallback_title("feat", "main"), "feat into main");
     }
 
     #[test]
@@ -735,5 +668,101 @@ mod tests {
         assert_eq!(strip_draft_prefix("日本語WIP: tail"), "日本語WIP: tail");
         assert_eq!(strip_draft_prefix("Ünïcödé: ümlaut"), "Ünïcödé: ümlaut");
         assert_eq!(strip_draft_prefix("WIP: 日本語 tail"), "日本語 tail");
+    }
+
+    fn desc_file(dir: &tempfile::TempDir, content: &str) -> String {
+        let path = dir.path().join("desc.md");
+        std::fs::write(&path, content).expect("write");
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn title_with_description_file_reads_the_file() {
+        // `--title X --description-file f` must honor f (the old code matched
+        // any --title first and silently dropped the file's content).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let f = desc_file(&tmp, "full\nnotes");
+        let (title, desc) =
+            resolve_title_and_description(Some(&"T".into()), Some(&f), None, "feat", "main")
+                .expect("resolve");
+        assert_eq!(title, "T");
+        assert_eq!(desc, "full\nnotes");
+    }
+
+    #[test]
+    fn title_with_description_flag_keeps_the_flag() {
+        let (title, desc) = resolve_title_and_description(
+            Some(&"T".into()),
+            None,
+            Some(&"flag body".into()),
+            "feat",
+            "main",
+        )
+        .expect("resolve");
+        assert_eq!(title, "T");
+        assert_eq!(desc, "flag body");
+    }
+
+    #[test]
+    fn title_with_both_descriptions_is_a_usage_error() {
+        // Same contract as issue create: which description would win when both
+        // sources are explicit is an implementation detail, so refuse.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let f = desc_file(&tmp, "file body");
+        let err = resolve_title_and_description(
+            Some(&"T".into()),
+            Some(&f),
+            Some(&"flag body".into()),
+            "feat",
+            "main",
+        )
+        .expect_err("conflicting descriptions must fail");
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn both_descriptions_without_title_is_also_a_usage_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let f = desc_file(&tmp, "file body");
+        let err = resolve_title_and_description(
+            None,
+            Some(&f),
+            Some(&"flag body".into()),
+            "feat",
+            "main",
+        )
+        .expect_err("conflicting descriptions must fail");
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn description_file_without_title_falls_back_to_branch_title() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let f = desc_file(&tmp, "body");
+        let (title, desc) =
+            resolve_title_and_description(None, Some(&f), None, "feat", "main").expect("resolve");
+        assert_eq!(title, "feat into main");
+        assert_eq!(desc, "body");
+    }
+
+    #[test]
+    fn description_file_is_explicit_even_when_empty() {
+        // An empty file means "no description", not "not provided": the fill
+        // fallback in create() must not override it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let f = desc_file(&tmp, "");
+        let (title, desc) =
+            resolve_title_and_description(None, Some(&f), None, "feat", "main").expect("resolve");
+        assert_eq!(title, "feat into main");
+        assert_eq!(desc, "");
+    }
+
+    #[test]
+    fn nothing_given_falls_back_to_branch_title_and_empty_description() {
+        let (title, desc) =
+            resolve_title_and_description(None, None, None, "feat", "main").expect("resolve");
+        assert_eq!(title, "feat into main");
+        assert_eq!(desc, "");
     }
 }

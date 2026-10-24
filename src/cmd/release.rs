@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::io::IsTerminal;
 
 use serde_json::{json, Value};
 
@@ -12,7 +13,8 @@ use crate::error::Error;
 ///
 /// # Errors
 ///
-/// Returns [`Error`] when the request fails or a notes file cannot be read.
+/// Returns [`Error`] when the request or a notes file read fails;
+/// `delete` without `--yes` is a usage error in non-interactive sessions.
 pub fn run(root: &Root, args: &ReleaseArgs) -> Result<(), Error> {
     match args {
         ReleaseArgs::List { list: list_opts } => list(root, list_opts),
@@ -39,7 +41,7 @@ fn list(root: &Root, opts: &crate::cli::ListOpts) -> Result<(), Error> {
     let per_page = opts.per_page;
     let page = opts.page;
     let paginate = opts.paginate;
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut query: Vec<(String, String)> = vec![("per_page".into(), per_page.to_string())];
     if let Some(p) = page {
@@ -53,7 +55,10 @@ fn list(root: &Root, opts: &crate::cli::ListOpts) -> Result<(), Error> {
     };
     crate::render::table::render_list(
         &items,
-        &["tag_name", "name", "released_at", "assets"],
+        // `assets` is an object (renders as a useless `<object>`) and its
+        // `sources`/`links` are arrays of objects; `assets.count` is the
+        // readable projection. JSON mode still dumps the full response.
+        &["tag_name", "name", "released_at", "assets.count"],
         ctx.json,
     )?;
     Ok(())
@@ -66,7 +71,7 @@ fn create(
     name: Option<&String>,
     ref_: Option<&String>,
 ) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut body = json!({ "tag_name": tag });
     if let Some(f) = notes_file {
@@ -82,7 +87,7 @@ fn create(
         "POST",
         &format!("projects/{pp}/releases"),
         &[],
-        Some(body),
+        Some(&body),
     )?;
     crate::render::table::render_one(
         &release,
@@ -93,7 +98,7 @@ fn create(
 }
 
 fn view(root: &Root, tag: &str) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let release: Value = ctx
         .client()
@@ -107,15 +112,25 @@ fn view(root: &Root, tag: &str) -> Result<(), Error> {
 }
 
 fn delete(root: &Root, tag: &str, yes: bool) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    // Resolve the target before asking: a usage error (wrong host, no -R)
+    // must surface before the user confirms anything.
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     if !yes {
+        // Non-interactive stdin (CI, piped scripts) answers EOF to a prompt:
+        // refusing up front keeps "aborted" from looking like success (exit 0)
+        // to scripts keyed on the exit code.
+        if !std::io::stdin().is_terminal() {
+            return Err(Error::usage(
+                "refusing to delete without --yes in a non-interactive session",
+            ));
+        }
         eprint!("Delete release {tag}? [y/N] ");
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
         if !line.trim().eq_ignore_ascii_case("y") {
             println!("aborted");
-            return Ok(());
+            return Err(Error::usage("aborted by user"));
         }
     }
     ctx.client().send_json_value(
@@ -137,7 +152,7 @@ fn upload(
     name: Option<&str>,
     link: bool,
 ) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
 
     if link || target.contains("://") {
@@ -148,7 +163,7 @@ fn upload(
             "POST",
             &format!("projects/{pp}/releases/{tag}/assets/links"),
             &[],
-            Some(body),
+            Some(&body),
         )?;
         crate::render::table::render_one(&created, &["id", "name", "url"], ctx.json)?;
         return Ok(());
@@ -187,7 +202,7 @@ fn upload(
         "POST",
         &format!("projects/{pp}/releases/{tag}/assets/links"),
         &[],
-        Some(body),
+        Some(&body),
     )?;
     crate::render::table::render_one(&created, &["id", "name", "url"], ctx.json)?;
     Ok(())

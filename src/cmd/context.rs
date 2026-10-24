@@ -27,6 +27,9 @@ fn detect_ci() -> Option<CiEnv> {
 /// `https://Host:443/...` and `auth login --hostname host` look up the same
 /// hosts.toml entry. Explicit non-default ports are kept.
 ///
+/// The schemeless remainder is canonicalized by [`canonical_host`]
+/// (`src/git`): lowercased, default ports dropped, FQDN trailing dot trimmed.
+///
 /// # Examples
 ///
 /// ```
@@ -39,20 +42,14 @@ fn detect_ci() -> Option<CiEnv> {
 /// ```
 #[must_use]
 pub fn normalize_host(h: &str) -> String {
-    let mut s = h.trim().to_ascii_lowercase();
+    let s = h.trim();
     if let Some(rest) = s.strip_prefix("https://") {
-        s = rest.trim_end_matches('/').to_string();
-    } else if let Some(rest) = s.strip_prefix("http://") {
-        s = rest.trim_end_matches('/').to_string();
+        return crate::git::canonical_host(rest.trim_end_matches('/'));
     }
-    if let Some((host, port)) = s.rsplit_once(':') {
-        let looks_default =
-            !host.is_empty() && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit());
-        if looks_default && (port == "443" || port == "80") {
-            s = host.to_string();
-        }
+    if let Some(rest) = s.strip_prefix("http://") {
+        return crate::git::canonical_host(rest.trim_end_matches('/'));
     }
-    s
+    crate::git::canonical_host(s)
 }
 
 /// Decide which host a command targets when it was detected from the git
@@ -101,6 +98,7 @@ pub fn target_hostname(root: &Root) -> Result<String, Error> {
         }
     }
     if let Ok(api_url) = std::env::var("CI_API_V4_URL") {
+        // host_of_api_url already returns a canonical host.
         if let Some(host) = crate::api::client::host_of_api_url(&api_url) {
             return Ok(host);
         }
@@ -415,6 +413,11 @@ mod tests {
         assert_eq!(
             normalize_host("gitlab.corp.example:8443"),
             "gitlab.corp.example:8443"
+        );
+        // FQDN trailing dots are trimmed: same host, same entry.
+        assert_eq!(
+            normalize_host("gitlab.corp.example."),
+            "gitlab.corp.example"
         );
     }
 

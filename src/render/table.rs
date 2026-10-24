@@ -47,7 +47,7 @@ pub fn render_one(item: &Value, fields: &[&str], json_mode: bool) -> Result<(), 
     let mut builder = Builder::new();
     builder.push_record(vec!["Field".to_string(), "Value".to_string()]);
     for f in fields {
-        builder.push_record(vec![f.to_string(), cell_str(item, f)]);
+        builder.push_record(vec![(*f).to_string(), cell_str(item, f)]);
     }
     println!("{}", builder.build().with(Style::markdown()));
     Ok(())

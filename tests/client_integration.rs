@@ -211,6 +211,83 @@ fn bodyless_post_sends_explicit_json_body() {
 }
 
 #[test]
+fn rate_limited_request_retries_once_with_retry_after() {
+    // First request: 429 with Retry-After: 1. Second: success. Proves the
+    // retry fires, honors the header, and surfaces the success.
+    let (base, rx) = spawn_server(|_| {
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            (
+                429,
+                vec![("Retry-After".to_string(), "1".to_string())],
+                json_body(&serde_json::json!({"message": "slow down"})),
+            )
+        } else {
+            (200, vec![], json_body(&serde_json::json!({"id": 1})))
+        }
+    });
+    let c = client_for(&base, Some(("tok", TokenKind::Personal)));
+    let started = std::time::Instant::now();
+    let v = c.get_json_value("user", &[]).expect("retry must succeed");
+    let elapsed = started.elapsed();
+    assert_eq!(v, serde_json::json!({"id": 1}));
+    // Retry-After: 1 was slept out (allowing slop for fast test machines).
+    assert!(
+        elapsed >= std::time::Duration::from_millis(900),
+        "must honor Retry-After, took only {elapsed:?}"
+    );
+    let first = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    let second = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    assert_eq!(first.path, second.path, "same request is replayed");
+}
+
+#[test]
+fn second_429_surfaces_as_an_error_after_exactly_one_retry() {
+    // Two consecutive 429s: exactly one retry, then the error surfaces.
+    let (base, _rx) = spawn_server(|_| (429, vec![], json_body(&serde_json::json!({}))));
+    let c = client_for(&base, None);
+    let err = c
+        .get_json_value("user", &[])
+        .expect_err("persistent 429 must fail");
+    assert!(err.to_string().contains("HTTP"));
+}
+
+#[test]
+fn patch_reaches_the_wire_with_json_body() {
+    // GitLab v4 has PATCH endpoints (e.g. personal_access_tokens self-rotate);
+    // the passthrough must not reject them as an unsupported method.
+    let (base, rx) = spawn_server(|_| (200, vec![], json_body(&serde_json::json!({"id": 1}))));
+    let c = client_for(&base, Some(("tok", TokenKind::Personal)));
+    let _ = c
+        .send_json_value(
+            "PATCH",
+            "personal_access_tokens/1/self",
+            &[],
+            Some(&serde_json::json!({"scopes": ["api"]})),
+        )
+        .unwrap();
+    let req = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    assert_eq!(req.method, "PATCH");
+    assert_eq!(
+        req.headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert_ne!(req.body, b"");
+    assert!(std::str::from_utf8(&req.body).unwrap().contains("scopes"));
+}
+
+#[test]
+fn unknown_methods_still_rejected() {
+    let (base, _rx) = spawn_server(|_| (200, vec![], json_body(&serde_json::json!({}))));
+    let c = client_for(&base, None);
+    let err = c
+        .send_json_value("BREW", "coffee", &[], None)
+        .expect_err("unsupported method must be a usage error");
+    assert_eq!(err.exit_code(), 2);
+}
+
+#[test]
 fn pagination_follows_x_next_page() {
     // Page 1: 2 items + X-Next-Page: 2. Page 2: 1 item + no next page.
     let (base, rx) = spawn_server(|req| {

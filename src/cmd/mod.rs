@@ -3,12 +3,6 @@
 //! [`dispatch`] routes the clap tree; [`resolve`] merges settings per
 //! precedence (flags > env > per-host > global) and builds the client.
 
-//! One module per command group, plus host/token precedence resolution.
-//!
-//! [`dispatch`] routes the clap tree; [`resolve`]
-//! merges settings per precedence (flags > env > per-host > global) and
-//! builds the client.
-
 /// The `api` passthrough command.
 pub mod api;
 /// The `auth` command group.

@@ -3,25 +3,52 @@ use serde_json::Value;
 use crate::cmd::Ctx;
 use crate::error::Error;
 
-/// Resolve the API project path: `--repo/-R` (path or full URL) > git remote.
+/// Encode an owner/name or owner/subgroup/name path for the API (`/` -> `%2F`),
+/// accepting an already-encoded path and a full URL.
 ///
-/// One shared implementation so every command group accepts the same
-/// spellings: numeric ID, `owner/name`, `group/sub/name`, full URL, and an
-/// already-encoded path (`group%2Fname`).
+/// A bare URL with no project path (`https://gitlab.com`) is a usage error:
+/// silently encoding it would send `https:%2F%2Fgitlab.com` to the API and
+/// surface as a confusing 404.
 ///
-/// When the default would come from the git remote but the remote's host is
-/// not the instance the command targets (see [`crate::cmd::target_hostname`],
-/// which may fall back to a single configured host), the remote's path is
-/// refused with a clear `-R` hint instead of querying the wrong instance.
+/// # Errors
+///
+/// Returns [`Error::Usage`] for a bare URL with no project path.
+pub fn encode_project_path(s: &str) -> Result<String, Error> {
+    let s = s.trim().trim_matches('/');
+    if let Some(rest) = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+    {
+        let Some(path) = rest.split_once('/').map(|(_, p)| p) else {
+            return Err(Error::usage(format!(
+                "{s} is a hostname, not a project path; use owner/repo (or a full URL with a path)"
+            )));
+        };
+        // Same `.git` rule as remote parsing: strip one terminal
+        // `repo.git` suffix, keep repeated or non-terminal ones.
+        return Ok(crate::git::clean_path(path).replace('/', "%2F"));
+    }
+    // Keep any existing %2F encoding intact.
+    Ok(s.replace('/', "%2F"))
+}
+
+/// Resolve the API project path: explicit target > `--repo/-R` > git remote.
+///
+/// One shared implementation for every command group (commands pass their
+/// positional target as `explicit`; everyone else passes `None`). When the
+/// default would come from the git remote but the remote's host is not the
+/// instance the command targets (see [`crate::cmd::target_hostname`], which
+/// may fall back to a single configured host), the remote's path is refused
+/// with a clear `-R` hint instead of querying the wrong instance.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Usage`] for a bare URL with no project path, the `-R`
 /// hint when the checkout's origin does not live on the target instance, and
 /// [`Error`] when git remote detection fails.
-pub fn project_path(root: &crate::cli::Root) -> Result<String, Error> {
-    if let Some(r) = &root.repo {
-        return crate::cmd::mr::encode_project_path(r);
+pub fn project_path(root: &crate::cli::Root, explicit: Option<&str>) -> Result<String, Error> {
+    if let Some(t) = explicit.or(root.repo.as_deref()) {
+        return encode_project_path(t);
     }
     let remote = crate::git::detect_remote()?;
     let target = crate::cmd::target_hostname(root)?;
@@ -89,6 +116,51 @@ pub fn milestone_id(ctx: &Ctx, pp: &str, title: &str) -> Result<u64, Error> {
     Err(Error::not_found(format!("milestone {title:?} not found")))
 }
 
+/// Resolve a `--description`/`--description-file` pair (both optional) into
+/// the text to send: the flag wins when both are given (that combination is
+/// otherwise silently resolved by position, which no user can predict), a
+/// file is read (stdin via `-`), `None`/`None` means no text.
+///
+/// Shared by `mr create` and `issue create`.
+///
+/// # Errors
+///
+/// Returns [`Error::Usage`] when both sources are given and [`Error`] when
+/// the file cannot be read.
+pub fn description_text(
+    description: Option<&String>,
+    description_file: Option<&String>,
+) -> Result<Option<String>, Error> {
+    match (description, description_file) {
+        (Some(_), Some(_)) => Err(Error::usage(
+            "--description and --description-file are mutually exclusive",
+        )),
+        (Some(d), None) => Ok(Some(d.clone())),
+        (None, Some(f)) => Ok(Some(crate::render::pager::read_input(f)?)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Resolve a `--body`/`--body-file` pair (both required-ish): exactly one
+/// source must be given.
+///
+/// Shared by `mr comment` and `issue comment`.
+///
+/// # Errors
+///
+/// Returns [`Error::Usage`] when both or neither source is given and
+/// [`Error`] when the file cannot be read.
+pub fn comment_text(body: Option<&String>, body_file: Option<&String>) -> Result<String, Error> {
+    match (body, body_file) {
+        (Some(_), Some(_)) => Err(Error::usage(
+            "--body and --body-file are mutually exclusive",
+        )),
+        (Some(b), None) => Ok(b.clone()),
+        (None, Some(f)) => crate::render::pager::read_input(f),
+        (None, None) => Err(Error::usage("comment requires --body or --body-file")),
+    }
+}
+
 /// The `--assignee/--reviewer/--author` error for `@me` under CI job tokens.
 #[must_use]
 pub fn at_me_needs_personal_token(flag: &str) -> Error {
@@ -117,4 +189,29 @@ pub fn user_flag_id(ctx: &Ctx, user: &str, flag: &str) -> Result<u64, Error> {
         };
     }
     user_id(ctx, user)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_project_path_variants() {
+        assert_eq!(encode_project_path("group/proj").unwrap(), "group%2Fproj");
+        assert_eq!(
+            encode_project_path("/group/sub/proj/").unwrap(),
+            "group%2Fsub%2Fproj"
+        );
+        assert_eq!(encode_project_path("group%2Fproj").unwrap(), "group%2Fproj");
+        assert_eq!(
+            encode_project_path("https://gitlab.com/group/sub/proj.git").unwrap(),
+            "group%2Fsub%2Fproj"
+        );
+        assert_eq!(encode_project_path("42").unwrap(), "42");
+        // A bare URL has no project path: usage error, not a nonsense
+        // encoding like `https:%2F%2Fgitlab.com`.
+        let err = encode_project_path("https://gitlab.com").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("hostname, not a project path"));
+    }
 }

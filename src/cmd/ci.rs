@@ -1,4 +1,3 @@
-use std::io::Read as _;
 use std::io::Write as _;
 
 use serde_json::{json, Value};
@@ -59,7 +58,7 @@ fn list(
     let per_page = opts.per_page;
     let page = opts.page;
     let paginate = opts.paginate;
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut query: Vec<(String, String)> = vec![("per_page".into(), per_page.to_string())];
     if let Some(r) = ref_ {
@@ -88,7 +87,7 @@ fn list(
 }
 
 fn status(root: &Root, ref_: Option<&str>, wait: bool, timeout: Option<u64>) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut query: Vec<(String, String)> = Vec::new();
     if let Some(r) = ref_ {
@@ -137,7 +136,7 @@ fn status(root: &Root, ref_: Option<&str>, wait: bool, timeout: Option<u64>) -> 
 }
 
 fn view(root: &Root, pipeline_id: u64) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let pipeline: Value = ctx
         .client()
@@ -157,7 +156,7 @@ fn trace(
     timeout: Option<u64>,
     pipeline: Option<u64>,
 ) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let job = match pipeline {
         Some(pid) => find_job_in_pipeline(&ctx, &pp, pid, target)?,
@@ -310,17 +309,14 @@ fn take_trace_text(carry: &mut Vec<u8>) -> String {
 /// The raw trace, or `None` while the endpoint 404s (no trace produced yet).
 fn fetch_raw(ctx: &crate::cmd::Ctx, path: &str) -> Result<Option<Vec<u8>>, Error> {
     let url = ctx.client().url(path, &[]);
-    let resp = match ctx.client().agent_get(&url)?.call() {
-        Ok(resp) => resp,
-        // GitLab 404s the trace of jobs that have not produced one yet
-        // (created/pending). During a follow that is "no output yet", not an
-        // error: keep polling until the first chunk appears.
-        Err(ureq::Error::Status(404, _)) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let mut buf = Vec::new();
-    resp.into_reader().read_to_end(&mut buf)?;
-    Ok(Some(buf))
+    // GitLab 404s the trace of jobs that have not produced one yet
+    // (created/pending). During a follow that is "no output yet", not an
+    // error: keep polling until the first chunk appears.
+    match ctx.client().get_bytes(&url) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(Error::NotFound(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 fn find_job(ctx: &crate::cmd::Ctx, pp: &str, target: &str) -> Result<Value, Error> {
@@ -393,7 +389,7 @@ fn find_job_in_pipeline(
 }
 
 fn run_pipeline(root: &Root, ref_: &str, variables: &[String]) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let mut vars = Vec::new();
     for v in variables {
@@ -417,7 +413,7 @@ fn run_pipeline(root: &Root, ref_: &str, variables: &[String]) -> Result<(), Err
         "POST",
         &format!("projects/{pp}/pipeline"),
         &[],
-        Some(body),
+        Some(&body),
     )?;
     crate::render::table::render_one(
         &pipeline,
@@ -428,7 +424,7 @@ fn run_pipeline(root: &Root, ref_: &str, variables: &[String]) -> Result<(), Err
 }
 
 fn retry(root: &Root, pipeline_id: u64) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let pipeline: Value = ctx.client().send_json_value(
         "POST",
@@ -441,7 +437,7 @@ fn retry(root: &Root, pipeline_id: u64) -> Result<(), Error> {
 }
 
 fn cancel(root: &Root, pipeline_id: u64) -> Result<(), Error> {
-    let pp = project_path(root)?;
+    let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
     let pipeline: Value = ctx.client().send_json_value(
         "POST",
@@ -462,16 +458,18 @@ fn lint(root: &Root, file: Option<&str>) -> Result<(), Error> {
     };
     // Project context is optional for lint but the API needs a project; use
     // detected project when available, else CI_LINT endpoint without project.
-    let pp = project_path(root).ok();
+    let pp = project_path(root, None).ok();
     let body = json!({ "content": content });
     let resp: Value = match pp {
-        Some(pp) => {
-            ctx.client()
-                .send_json_value("POST", &format!("projects/{pp}/ci/lint"), &[], Some(body))
-        }
+        Some(pp) => ctx.client().send_json_value(
+            "POST",
+            &format!("projects/{pp}/ci/lint"),
+            &[],
+            Some(&body),
+        ),
         None => ctx
             .client()
-            .send_json_value("POST", "ci/lint", &[], Some(body)),
+            .send_json_value("POST", "ci/lint", &[], Some(&body)),
     }?;
     crate::render::table::render_one(&resp, &["valid", "errors", "warnings"], ctx.json)?;
     Ok(())

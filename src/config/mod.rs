@@ -1,7 +1,5 @@
 //! Configuration files: global `config.toml` and per-host `hosts.toml`.
 
-//! Configuration files: global `config.toml` and per-host `hosts.toml`.
-
 /// Per-host connection and auth settings.
 pub mod hosts;
 /// Global settings with dotted-key access.

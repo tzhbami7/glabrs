@@ -2,6 +2,7 @@ use serde_json::Value;
 
 use crate::cli::repo_cmd::RepoArgs;
 use crate::cli::Root;
+use crate::cmd::helpers::{self, project_path};
 use crate::cmd::resolve;
 use crate::error::Error;
 
@@ -19,26 +20,6 @@ pub fn run(root: &Root, args: &RepoArgs) -> Result<(), Error> {
         } => list(root, group.as_deref(), list_opts),
         RepoArgs::Clone { target, dir } => clone(root, target, dir.as_deref()),
     }
-}
-
-/// Resolve project target: explicit > --repo/-R > git remote (checked
-/// against the resolved target host like every other group).
-fn project_path(root: &Root, target: Option<&str>) -> Result<String, Error> {
-    if let Some(t) = target {
-        return super::mr::encode_project_path(t);
-    }
-    if let Some(r) = &root.repo {
-        return super::mr::encode_project_path(r);
-    }
-    let remote = crate::git::detect_remote()?;
-    let host = crate::cmd::target_hostname(root)?;
-    if remote.hostname != host {
-        return Err(Error::usage(format!(
-            "this checkout's origin is {} but the target instance is {host}; pass -R <project> or --hostname",
-            remote.hostname
-        )));
-    }
-    Ok(remote.project_path.replace('/', "%2F"))
 }
 
 fn view(root: &Root, target: Option<&str>, web: bool) -> Result<(), Error> {
@@ -91,7 +72,7 @@ fn list(root: &Root, group: Option<&str>, opts: &crate::cli::ListOpts) -> Result
     ];
     let path = match group {
         Some(g) => {
-            let g_enc = super::mr::encode_project_path(g)?;
+            let g_enc = helpers::encode_project_path(g)?;
             query.push(("include_subgroups".into(), "true".into()));
             format!("groups/{g_enc}/projects")
         }

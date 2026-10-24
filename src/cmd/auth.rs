@@ -28,7 +28,7 @@ pub fn run(root: &Root, args: &AuthArgs) -> Result<(), Error> {
             let hosts = Hosts::load()?;
             status(root, &hosts, hostname.as_ref())
         }
-        AuthArgs::Logout { hostname } => logout(root, hostname.as_ref()),
+        AuthArgs::Logout { hostname: _ } => logout(root),
     }
 }
 
@@ -115,11 +115,28 @@ fn login(
 /// The host to report when the user narrows the scope: `--hostname` beats
 /// `GLABRS_HOST` beats `GITLAB_HOST` (same precedence as `login`). `None`
 /// means "report every configured host".
+///
+/// Reads the env vars for the invocation and delegates the pure ladder to
+/// [`explicit_target_from`], which is what tests exercise (no process-global
+/// mutation).
 fn explicit_target(hostname_flag: Option<&String>) -> Option<String> {
+    explicit_target_from(
+        hostname_flag,
+        std::env::var("GLABRS_HOST").ok(),
+        std::env::var("GITLAB_HOST").ok(),
+    )
+}
+
+/// Pure precedence ladder: flag > `GLABRS_HOST` > `GITLAB_HOST`.
+fn explicit_target_from(
+    hostname_flag: Option<&String>,
+    glabrs_host: Option<String>,
+    gitlab_host: Option<String>,
+) -> Option<String> {
     hostname_flag
         .cloned()
-        .or_else(|| std::env::var("GLABRS_HOST").ok())
-        .or_else(|| std::env::var("GITLAB_HOST").ok())
+        .or(glabrs_host)
+        .or(gitlab_host)
         .map(|h| crate::cmd::normalize_host(&h))
 }
 
@@ -262,16 +279,14 @@ fn status_summary(hostname: &str, user: &serde_json::Value, api_url: &str) -> St
     )
 }
 
-fn logout(root: &Root, hostname_flag: Option<&String>) -> Result<(), Error> {
+/// Remove stored credentials for the target host.
+///
+/// The host is resolved with the shared ladder ([`target_hostname`]):
+/// `--hostname` > `GLABRS_HOST` > `GITLAB_HOST` > CI > git remote (with the
+/// single-configured-host fallback), matching every other command.
+fn logout(root: &Root) -> Result<(), Error> {
     let mut hosts = Hosts::load()?;
-    let hostname = match hostname_flag
-        .cloned()
-        .or_else(|| std::env::var("GLABRS_HOST").ok())
-        .or_else(|| std::env::var("GITLAB_HOST").ok())
-    {
-        Some(h) => crate::cmd::normalize_host(&h),
-        None => crate::git::detect_remote()?.hostname,
-    };
+    let hostname = crate::cmd::target_hostname(root)?;
 
     if hosts.remove(&hostname) {
         hosts.save()?;
@@ -360,11 +375,26 @@ mod tests {
 
     #[test]
     fn explicit_target_prefers_flag_over_env() {
-        // SAFETY: single-threaded test body; env vars are process-global and
-        // no other test in this binary reads these names concurrently.
-        std::env::set_var("GLABRS_HOST", "from-env.example");
-        let got = explicit_target(Some(&"from-flag.example".to_string()));
-        std::env::remove_var("GLABRS_HOST");
+        // Pure ladder: no process-global env mutation (tests in one binary run
+        // on parallel threads).
+        let got = explicit_target_from(
+            Some(&"from-flag.example".to_string()),
+            Some("from-env.example".into()),
+            Some("from-gitlab-env.example".into()),
+        );
         assert_eq!(got.as_deref(), Some("from-flag.example"));
+
+        let got = explicit_target_from(None, Some("from-env.example".into()), None);
+        assert_eq!(got.as_deref(), Some("from-env.example"));
+
+        let got = explicit_target_from(None, None, Some("from-gitlab-env.example".into()));
+        assert_eq!(got.as_deref(), Some("from-gitlab-env.example"));
+
+        // Everything empty: sweep every configured host.
+        assert_eq!(explicit_target_from(None, None, None), None);
+
+        // Values are normalized like everywhere else.
+        let got = explicit_target_from(None, Some("GitLab.Corp.Example:443".into()), None);
+        assert_eq!(got.as_deref(), Some("gitlab.corp.example"));
     }
 }
