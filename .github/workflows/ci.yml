@@ -22,4 +22,27 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --all-features --locked
+
+  msrv:
+    # The crate declares rust-version = 1.81; prove it compiles there so an
+    # accidental newer-lang feature cannot slip into a "supports 1.81" release.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.81.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (MSRV 1.81)
+        run: cargo check --locked --all-features
+
+  audit:
+    # Dependencies advisory check for a credentials-handling CLI.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Security audit
+        run: cargo audit

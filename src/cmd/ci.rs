@@ -117,7 +117,7 @@ fn status(root: &Root, ref_: Option<&str>, wait: bool, timeout: Option<u64>) -> 
                     .unwrap_or(0);
                 println!("pipeline #{id}: {st}");
             }
-            return pipeline_exit(st);
+            return pipeline_exit(st, wait);
         }
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return Err(Error::runtime(format!(
@@ -207,9 +207,13 @@ fn trace(
             }
             if !ctx.json {
                 eprintln!();
-                eprintln!("job #{job_id} finished: {st}");
+                if is_terminal_state(st) {
+                    eprintln!("job #{job_id} finished: {st}");
+                } else {
+                    eprintln!("job #{job_id} is still {st} (use --follow to keep streaming)");
+                }
             }
-            return job_exit(st);
+            return job_exit(st, follow);
         }
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return Err(Error::runtime(format!(
@@ -479,27 +483,40 @@ fn is_terminal_state(st: &str) -> bool {
     matches!(st, "success" | "failed" | "canceled" | "skipped")
 }
 
-fn pipeline_exit(st: &str) -> Result<(), Error> {
+fn pipeline_exit(st: &str, waited: bool) -> Result<(), Error> {
     // Exhaustive on the documented status set; anything unknown fails so a
     // new GitLab status string cannot mask a still-running pipeline as
     // success in scripts. `skipped` is a success like in glab: a pipeline
     // that was skipped by rules did not fail.
+    //
+    // Without `--wait` the command is a snapshot, not a gate: reporting
+    // `running`/`pending` succeeds (exit 0) so scripts can poll without
+    // treating "not done yet" as a failure; `--wait` still fails when it
+    // would otherwise block forever on a non-terminal state.
     match st {
         "success" | "skipped" => Ok(()),
         "failed" => Err(Error::runtime("pipeline failed")),
         "canceled" => Err(Error::runtime("pipeline canceled")),
+        "running" | "pending" | "created" | "waiting_for_resource" | "preparing" if !waited => {
+            Ok(())
+        }
         other => Err(Error::runtime(format!(
             "pipeline not finished (status: {other})"
         ))),
     }
 }
 
-fn job_exit(st: &str) -> Result<(), Error> {
-    // Same contract as [`pipeline_exit`], including skipped-as-success.
+fn job_exit(st: &str, followed: bool) -> Result<(), Error> {
+    // Same contract as [`pipeline_exit`], including skipped-as-success:
+    // a `trace` without `--follow` is a snapshot, so a still-active job
+    // exits 0 (with the "still <status>" notice) instead of failing.
     match st {
         "success" | "skipped" => Ok(()),
         "failed" => Err(Error::runtime("job failed")),
         "canceled" => Err(Error::runtime("job canceled")),
+        "running" | "pending" | "created" | "waiting_for_resource" | "preparing" if !followed => {
+            Ok(())
+        }
         other => Err(Error::runtime(format!(
             "job not finished (status: {other})"
         ))),
@@ -512,23 +529,63 @@ mod tests {
 
     #[test]
     fn pipeline_exit_codes() {
-        assert!(pipeline_exit("success").is_ok());
+        assert!(pipeline_exit("success", true).is_ok());
         // Like glab: rules skipped the pipeline, it did not fail.
-        assert!(pipeline_exit("skipped").is_ok());
-        assert!(pipeline_exit("failed").is_err());
-        assert!(pipeline_exit("canceled").is_err());
-        // Unknown/running statuses must not read as success.
-        assert!(pipeline_exit("running").is_err());
-        assert!(pipeline_exit("pending").is_err());
-        assert!(pipeline_exit("some_future_status").is_err());
+        assert!(pipeline_exit("skipped", true).is_ok());
+        assert!(pipeline_exit("failed", true).is_err());
+        assert!(pipeline_exit("canceled", true).is_err());
+        // With --wait a non-terminal status must not read as success.
+        assert!(pipeline_exit("running", true).is_err());
+        assert!(pipeline_exit("pending", true).is_err());
+        assert!(pipeline_exit("some_future_status", true).is_err());
+    }
+
+    #[test]
+    fn pipeline_snapshot_exit_codes() {
+        // Without --wait the command reports the current state: still-running
+        // statuses exit 0 (scripts may poll), terminal failures still fail,
+        // and an unknown status never reads as success.
+        for st in [
+            "running",
+            "pending",
+            "created",
+            "waiting_for_resource",
+            "preparing",
+        ] {
+            assert!(
+                pipeline_exit(st, false).is_ok(),
+                "{st} must be a snapshot ok"
+            );
+        }
+        assert!(pipeline_exit("failed", false).is_err());
+        assert!(pipeline_exit("canceled", false).is_err());
+        assert!(pipeline_exit("some_future_status", false).is_err());
     }
 
     #[test]
     fn job_exit_codes() {
-        assert!(job_exit("success").is_ok());
-        assert!(job_exit("skipped").is_ok()); // same contract as pipelines
-        assert!(job_exit("failed").is_err());
-        assert!(job_exit("running").is_err());
+        assert!(job_exit("success", true).is_ok());
+        assert!(job_exit("skipped", true).is_ok()); // same contract as pipelines
+        assert!(job_exit("failed", true).is_err());
+        assert!(job_exit("running", true).is_err());
+    }
+
+    #[test]
+    fn job_snapshot_exit_codes() {
+        // trace without --follow is a snapshot: active statuses exit 0, the
+        // notice (not "finished") is printed, terminal failures still fail.
+        for st in [
+            "running",
+            "pending",
+            "created",
+            "waiting_for_resource",
+            "preparing",
+        ] {
+            assert!(job_exit(st, false).is_ok(), "{st} must be a snapshot ok");
+        }
+        assert!(job_exit("failed", false).is_err());
+        assert!(job_exit("canceled", false).is_err());
+        assert!(job_exit("some_future_status", false).is_err());
     }
 
     #[test]

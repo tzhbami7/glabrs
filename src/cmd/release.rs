@@ -152,6 +152,10 @@ fn upload(
     name: Option<&str>,
     link: bool,
 ) -> Result<(), Error> {
+    // NOTE: the file path below is fully in-memory (file bytes + the multipart
+    // body are both buffered). Fine for typical release assets; a streaming
+    // multipart body (ureq `send` with a `Read` + known length) is the fix if
+    // multi-GB uploads ever matter.
     let pp = project_path(root, None)?;
     let ctx = resolve(root, root.hostname.as_deref())?;
 

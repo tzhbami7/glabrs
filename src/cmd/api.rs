@@ -31,10 +31,13 @@ pub fn run(root: &Root, args: &ApiArgs) -> Result<(), Error> {
     }
     let mut path = args.path.clone();
     for (k, v) in &path_fields {
-        path = path.replace(
-            &format!(":{k}"),
-            &crate::api::client::urlencode_with(v, true),
-        );
+        let placeholder = format!(":{k}");
+        if !path.contains(&placeholder) {
+            return Err(Error::usage(format!(
+                "--field :{k} has no matching :{k} placeholder in the path"
+            )));
+        }
+        path = path.replace(&placeholder, &crate::api::client::urlencode_with(v, true));
     }
 
     let body = match &args.input {

@@ -114,7 +114,10 @@ pub fn target_hostname(root: &Root) -> Result<String, Error> {
 /// Resolve the target host, merge settings per precedence, and build the client.
 ///
 /// Precedence: flags > env (`GLABRS_HOST` / `GITLAB_HOST` / `GITLAB_TOKEN` / CI) >
-/// per-host > global.
+/// per-host > global. The CI environment (`CI_JOB_TOKEN` + `CI_API_V4_URL`)
+/// applies only when the resolved target host is the CI host; an explicit
+/// `--hostname` for a different instance falls through to per-host/global
+/// settings instead of receiving the job token.
 ///
 /// # Errors
 ///
@@ -132,7 +135,9 @@ pub fn resolve(root: &Root, hostname_flag: Option<&str>) -> Result<Ctx, Error> {
 
     // CI detection first: inside a GitLab job, CI_API_V4_URL is authoritative
     // and no stored credentials are needed. The --token flag (clap-populated
-    // from GITLAB_TOKEN) still overrides CI.
+    // from GITLAB_TOKEN) still overrides CI. The CI env applies only when the
+    // resolved target host is the CI host: an explicit --hostname pointing at
+    // another instance must never receive this job's CI_JOB_TOKEN.
     let ci = detect_ci();
     let hostname = match hostname_flag
         .map(normalize_host)
@@ -157,6 +162,10 @@ pub fn resolve(root: &Root, hostname_flag: Option<&str>) -> Result<Ctx, Error> {
             ),
         },
     };
+    let ci = ci.filter(|env| {
+        crate::api::client::host_of_api_url(&env.api_url)
+            .map_or(true, |ci_host| ci_host == hostname)
+    });
 
     let host_cfg = hosts
         .get(&normalize_host(&hostname))

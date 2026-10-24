@@ -138,15 +138,22 @@ token travels over an unverified connection). Prefer `ca_file`.
 - HTTP 404 exits `4` (not found) and HTTP 401 exits `3` (auth), so scripts can
   distinguish a typo'd IID from a network failure. A `429` is retried once,
   honoring `Retry-After`.
+- `ci status` / `ci trace` mirror the pipeline/job result: terminal failure
+  exits `1`. Without `--wait` / `--follow` they are snapshots — a
+  still-running status prints the current state and exits `0`.
 - `--verbose` prints API method and path only — never headers or tokens.
-- `--description-file -` reads stdin; long output uses `GLABRS_PAGER` >
-  `PAGER` > config `pager` > `less`; `--no-pager` bypasses it.
+- `--description-file -` reads stdin. `mr diff` (and `--web`-less long views)
+  use `GLABRS_PAGER` > `PAGER` > config `pager` > `less`; `--no-pager`
+  bypasses it.
 - `-R` accepts a numeric ID, `owner/name`, `group/sub/name`, an
   already-encoded path, or a full URL with a path — a bare URL with no path
-  (`https://gitlab.com`) is a usage error.
+  (`https://gitlab.com`) is a usage error, and a URL pointing at a different
+  host than the target instance is refused (pass `--hostname` explicitly).
 - `issue delete` / `release delete` require `--yes` in non-interactive
   sessions (a piped stdin can never confirm); an interactive `[y/N]` refusal
   exits `2`, not `0`.
+- `config get` reports unknown keys with exit `4`; `config unset` refuses a
+  no-op on a missing key the same way (like `git config --unset`).
 
 ## License
 

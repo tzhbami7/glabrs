@@ -105,14 +105,20 @@ impl Hosts {
 
     /// Persist to disk with 0600 permissions.
     ///
+    /// The config directory is created 0700 when it does not exist yet (it
+    /// holds secrets); an existing directory's permissions are left untouched,
+    /// so a user-managed setup is never chmod'd behind their back.
+    ///
     /// # Errors
     ///
     /// Returns [`Error`] when directory creation, serialization, or the write
     /// fails.
     pub fn save(&self) -> Result<(), Error> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-            restrict_dir_perms(parent);
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+                restrict_dir_perms(parent);
+            }
         }
         let text = toml::to_string_pretty(&self.file)
             .map_err(|e| Error::runtime(format!("hosts.toml: {e}")))?;

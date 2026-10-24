@@ -10,10 +10,15 @@ use crate::error::Error;
 /// silently encoding it would send `https:%2F%2Fgitlab.com` to the API and
 /// surface as a confusing 404.
 ///
+/// Returns the path plus the parsed target host (canonical, like every other
+/// host source) so callers can cross-check it against the instance the
+/// command resolves to — `-R https://a.example/g/p` against `--hostname
+/// b.example` would otherwise query the wrong instance with a valid path.
+///
 /// # Errors
 ///
 /// Returns [`Error::Usage`] for a bare URL with no project path.
-pub fn encode_project_path(s: &str) -> Result<String, Error> {
+pub fn encode_project_path(s: &str) -> Result<(String, Option<String>), Error> {
     let s = s.trim().trim_matches('/');
     if let Some(rest) = s
         .strip_prefix("https://")
@@ -26,10 +31,14 @@ pub fn encode_project_path(s: &str) -> Result<String, Error> {
         };
         // Same `.git` rule as remote parsing: strip one terminal
         // `repo.git` suffix, keep repeated or non-terminal ones.
-        return Ok(crate::git::clean_path(path).replace('/', "%2F"));
+        let host = rest
+            .split_once('/')
+            .map(|(h, _)| h)
+            .map(crate::git::canonical_host);
+        return Ok((crate::git::clean_path(path).replace('/', "%2F"), host));
     }
     // Keep any existing %2F encoding intact.
-    Ok(s.replace('/', "%2F"))
+    Ok((s.replace('/', "%2F"), None))
 }
 
 /// Resolve the API project path: explicit target > `--repo/-R` > git remote.
@@ -41,14 +50,29 @@ pub fn encode_project_path(s: &str) -> Result<String, Error> {
 /// may fall back to a single configured host), the remote's path is refused
 /// with a clear `-R` hint instead of querying the wrong instance.
 ///
+/// An explicit URL target (`-R https://a.example/g/p`) is cross-checked the
+/// same way: its host must match the resolved target instance, so a typo'd
+/// `--hostname` cannot quietly query another installation.
+///
 /// # Errors
 ///
-/// Returns [`Error::Usage`] for a bare URL with no project path, the `-R`
-/// hint when the checkout's origin does not live on the target instance, and
-/// [`Error`] when git remote detection fails.
+/// Returns [`Error::Usage`] for a bare URL with no project path or a URL
+/// whose host differs from the target instance, the `-R` hint when the
+/// checkout's origin does not live on the target instance, and [`Error`]
+/// when git remote detection fails.
 pub fn project_path(root: &crate::cli::Root, explicit: Option<&str>) -> Result<String, Error> {
     if let Some(t) = explicit.or(root.repo.as_deref()) {
-        return encode_project_path(t);
+        let (path, url_host) = encode_project_path(t)?;
+        if let Some(host) = url_host {
+            let target = crate::cmd::target_hostname(root)?;
+            if host != target {
+                return Err(Error::usage(format!(
+                    "-R {t} points at {host} but the target instance is {target}; \
+                     pass --hostname {host} or use the bare path"
+                )));
+            }
+        }
+        return Ok(path);
     }
     let remote = crate::git::detect_remote()?;
     let target = crate::cmd::target_hostname(root)?;
@@ -197,17 +221,35 @@ mod tests {
 
     #[test]
     fn encode_project_path_variants() {
-        assert_eq!(encode_project_path("group/proj").unwrap(), "group%2Fproj");
+        assert_eq!(
+            encode_project_path("group/proj").unwrap(),
+            ("group%2Fproj".to_string(), None)
+        );
         assert_eq!(
             encode_project_path("/group/sub/proj/").unwrap(),
-            "group%2Fsub%2Fproj"
+            ("group%2Fsub%2Fproj".to_string(), None)
         );
-        assert_eq!(encode_project_path("group%2Fproj").unwrap(), "group%2Fproj");
+        assert_eq!(
+            encode_project_path("group%2Fproj").unwrap(),
+            ("group%2Fproj".to_string(), None)
+        );
         assert_eq!(
             encode_project_path("https://gitlab.com/group/sub/proj.git").unwrap(),
-            "group%2Fsub%2Fproj"
+            (
+                "group%2Fsub%2Fproj".to_string(),
+                Some("gitlab.com".to_string())
+            )
         );
-        assert_eq!(encode_project_path("42").unwrap(), "42");
+        assert_eq!(encode_project_path("42").unwrap(), ("42".to_string(), None));
+        // The URL host is canonicalized like every other host source, so a
+        // fancy spelling still matches the plain hosts.toml entry.
+        assert_eq!(
+            encode_project_path("https://GitLab.Corp.Example:443/group/proj").unwrap(),
+            (
+                "group%2Fproj".to_string(),
+                Some("gitlab.corp.example".to_string())
+            )
+        );
         // A bare URL has no project path: usage error, not a nonsense
         // encoding like `https:%2F%2Fgitlab.com`.
         let err = encode_project_path("https://gitlab.com").unwrap_err();

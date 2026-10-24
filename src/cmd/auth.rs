@@ -28,7 +28,7 @@ pub fn run(root: &Root, args: &AuthArgs) -> Result<(), Error> {
             let hosts = Hosts::load()?;
             status(root, &hosts, hostname.as_ref())
         }
-        AuthArgs::Logout { hostname: _ } => logout(root),
+        AuthArgs::Logout { hostname } => logout(root, hostname.as_ref()),
     }
 }
 
@@ -281,12 +281,18 @@ fn status_summary(hostname: &str, user: &serde_json::Value, api_url: &str) -> St
 
 /// Remove stored credentials for the target host.
 ///
-/// The host is resolved with the shared ladder ([`target_hostname`]):
-/// `--hostname` > `GLABRS_HOST` > `GITLAB_HOST` > CI > git remote (with the
-/// single-configured-host fallback), matching every other command.
-fn logout(root: &Root) -> Result<(), Error> {
+/// The host is resolved with the shared ladder ([`target_hostname`]) when the
+/// subcommand's `--hostname` is absent: `--hostname` > `GLABRS_HOST` >
+/// `GITLAB_HOST` > CI > git remote (with the single-configured-host fallback),
+/// matching every other command. The subcommand's own flag is passed through
+/// explicitly (not via the global `Root.hostname`), so its value can never be
+/// lost to clap argument-merging behavior.
+fn logout(root: &Root, hostname_flag: Option<&String>) -> Result<(), Error> {
     let mut hosts = Hosts::load()?;
-    let hostname = crate::cmd::target_hostname(root)?;
+    let hostname = match hostname_flag {
+        Some(h) => crate::cmd::normalize_host(h),
+        None => crate::cmd::target_hostname(root)?,
+    };
 
     if hosts.remove(&hostname) {
         hosts.save()?;

@@ -72,7 +72,7 @@ fn list(root: &Root, group: Option<&str>, opts: &crate::cli::ListOpts) -> Result
     ];
     let path = match group {
         Some(g) => {
-            let g_enc = helpers::encode_project_path(g)?;
+            let (g_enc, _) = helpers::encode_project_path(g)?;
             query.push(("include_subgroups".into(), "true".into()));
             format!("groups/{g_enc}/projects")
         }
@@ -121,19 +121,47 @@ fn clone(root: &Root, target: &str, dir: Option<&str>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Open a URL in the browser ($BROWSER > xdg-open).
+/// Open a URL in the browser per the XDG convention: `$BROWSER` is a
+/// colon-separated list of commands tried in order, `%s` (and `%%`) are
+/// substituted, a command without `%s` gets the URL appended. Falls back to
+/// `xdg-open` when unset or empty. The first command that spawns and exits
+/// successfully wins; spawn failures (missing binary) and nonzero exits fall
+/// through to the next candidate.
 ///
 /// # Errors
 ///
-/// Returns [`Error`] when the browser cannot be spawned or exits nonzero.
+/// Returns [`Error`] when every candidate fails to spawn or exits nonzero.
 pub fn open_browser(url: &str) -> Result<(), Error> {
-    let browser = std::env::var("BROWSER").unwrap_or_else(|_| "xdg-open".to_string());
-    let status = std::process::Command::new(browser)
-        .arg(url)
-        .status()
-        .map_err(|e| Error::runtime(format!("browser: {e}")))?;
-    if !status.success() {
-        return Err(Error::runtime("browser exited nonzero"));
+    let raw = std::env::var("BROWSER").unwrap_or_else(|_| "xdg-open".to_string());
+    let mut last: Option<Error> = None;
+    for field in raw.split(':') {
+        let field = field.trim();
+        if field.is_empty() {
+            continue; // "cmd1::cmd2" and a trailing colon are tolerated
+        }
+        let (program, args): (&str, Vec<&str>) =
+            if let Some((before, after)) = field.split_once("%s") {
+                let mut args: Vec<&str> = before.split_whitespace().collect();
+                args.extend(after.split_whitespace());
+                (args[0], args[1..].to_vec())
+            } else {
+                let mut parts = field.split_whitespace();
+                let Some(program) = parts.next() else {
+                    continue;
+                };
+                (program, parts.collect())
+            };
+        // %% is an escaped literal %, applied after the %s split.
+        let args: Vec<String> = args.into_iter().map(|a| a.replace("%%", "%")).collect();
+        let status = std::process::Command::new(program)
+            .args(&args)
+            .arg(url)
+            .status();
+        match status {
+            Ok(st) if st.success() => return Ok(()),
+            Ok(st) => last = Some(Error::runtime(format!("browser {program} exited {st}"))),
+            Err(e) => last = Some(Error::runtime(format!("browser {program}: {e}"))),
+        }
     }
-    Ok(())
+    Err(last.unwrap_or_else(|| Error::runtime("no browser configured ($BROWSER is empty)")))
 }

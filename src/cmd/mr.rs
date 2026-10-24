@@ -561,7 +561,16 @@ fn fetch_mr(ctx: &crate::cmd::Ctx, pp: &str, iid: u64) -> Result<Value, Error> {
 }
 
 fn current_branch() -> Result<String, Error> {
-    crate::git::run_git(&["rev-parse", "--abbrev-ref", "HEAD"])
+    // Detached HEAD reports the literal "HEAD": `--push` would push it while
+    // the API call sends source_branch=HEAD and fails confusingly, so refuse
+    // with the actual remedy.
+    let branch = crate::git::run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if branch == "HEAD" {
+        return Err(Error::usage(
+            "HEAD is detached; check out (or create) a branch before creating an MR",
+        ));
+    }
+    Ok(branch)
 }
 
 fn run_git_push(branch: &str) -> Result<(), Error> {

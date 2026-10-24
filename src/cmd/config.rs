@@ -101,6 +101,11 @@ fn unset(_root: &Root, key: &str, hostname: Option<&str>) -> Result<(), Error> {
         }
     } else {
         let mut cfg = Config::load()?;
+        // Same not-found contract as the host side (and `git config --unset`):
+        // a no-op unset must not look like success to scripts.
+        if cfg.get(key).is_none() {
+            return Err(Error::not_found(format!("unknown key {key}")));
+        }
         cfg.unset(key);
         cfg.save()?;
     }
