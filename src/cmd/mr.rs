@@ -391,11 +391,10 @@ fn diff(root: &Root, iid: u64) -> Result<(), Error> {
             }
         }
     }
-    if ctx.no_pager || out.is_empty() {
-        print!("{out}");
-    } else {
-        crate::render::pager::page(&out, ctx.no_pager)?;
+    if out.is_empty() {
+        return Ok(());
     }
+    crate::render::pager::page(&out, ctx.no_pager)?;
     Ok(())
 }
 
@@ -630,16 +629,47 @@ fn strip_draft_prefix(title: &str) -> String {
 ///
 /// Tries `origin/<target>..origin/<source>`, falling back to the local branch
 /// range (fresh clones of new branches may not have origin/<source> yet).
-/// Returns `"Update branch"` with an empty description when git has nothing.
+/// The title is the *newest* commit's subject (`-1 --reverse` takes the last
+/// commit of the range), matching GitHub/glab convention — a multi-commit MR
+/// titled from the oldest ("bottom") commit reads upside down. An empty
+/// result falls back to "Update branch" with an empty description.
 fn fill_from_commits(source: &str, target: &str) -> (String, String) {
     let remote_range = format!("origin/{target}..origin/{source}");
     let local_range = format!("{target}..{source}");
-    let log = crate::git::run_git(&["log", "--pretty=format:%s%n%b", &remote_range])
-        .or_else(|_| crate::git::run_git(&["log", "--pretty=format:%s%n%b", &local_range]))
-        .unwrap_or_default();
-    let mut lines = log.lines();
-    let title = lines.next().unwrap_or("Update branch").to_string();
-    let body: String = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+    let log = crate::git::run_git(&[
+        "log",
+        "--reverse",
+        "--pretty=format:%s%n%b%n%x00",
+        "-1",
+        &remote_range,
+    ])
+    .or_else(|_| {
+        crate::git::run_git(&[
+            "log",
+            "--reverse",
+            "--pretty=format:%s%n%b%n%x00",
+            "-1",
+            &local_range,
+        ])
+    })
+    .unwrap_or_default();
+    parse_fill_log(&log)
+}
+
+/// Pure: turn one `git log --reverse --pretty=format:%s%n%b%n%x00 -1` record
+/// into (title, description). Empty output (git failed, or the range has no
+/// commits) falls back to "Update branch" with an empty description.
+///
+/// Separated from the git-spawning wrapper so the parsing rules are testable
+/// without redirecting the process cwd.
+fn parse_fill_log(log: &str) -> (String, String) {
+    let record = log.split('\0').next().unwrap_or("").trim();
+    if record.is_empty() {
+        return ("Update branch".to_string(), String::new());
+    }
+    let mut parts = record.splitn(2, '\n');
+    let title = parts.next().unwrap_or("Update branch").to_string();
+    let body = parts.next().unwrap_or("").trim().to_string();
     (title, body)
 }
 
@@ -657,6 +687,26 @@ fn default_branch(ctx: &crate::cmd::Ctx, pp: &str) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_fill_log_takes_the_newest_record() {
+        // `--reverse -1` yields exactly one record; the parser still takes
+        // only the first (defensive against a future format change).
+        let log = "newest subject\nnewest body\n\n\0old record would follow\0";
+        let (title, body) = parse_fill_log(log);
+        assert_eq!(title, "newest subject");
+        assert_eq!(body, "newest body");
+
+        // Subject without a body.
+        let (title, body) = parse_fill_log("only subject\n\n\0");
+        assert_eq!(title, "only subject");
+        assert_eq!(body, "");
+
+        // Empty output (git failed or an empty range): the documented fallback.
+        let (title, body) = parse_fill_log("");
+        assert_eq!(title, "Update branch");
+        assert_eq!(body, "");
+    }
 
     #[test]
     fn fallback_title_format() {

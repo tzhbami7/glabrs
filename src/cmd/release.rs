@@ -199,7 +199,19 @@ fn upload(
     // prefix), not the project web URL — /uploads lives at instance scope.
     let rel = extract_upload_path(url)
         .ok_or_else(|| Error::runtime(format!("unexpected upload url: {url}")))?;
+    // instance_root echoes unparseable api_urls unchanged; never paste that
+    // into a link URL (same guard as web_base_from_api).
     let root_base = crate::api::client::instance_root(&ctx.client().api_url);
+    let root_base = url::Url::parse(&root_base)
+        .ok()
+        .filter(|u| u.host_str().is_some() && matches!(u.scheme(), "http" | "https"))
+        .map(|u| u.to_string())
+        .ok_or_else(|| {
+            Error::runtime(format!(
+                "cannot derive instance root from {}",
+                ctx.client().api_url
+            ))
+        })?;
     let full_url = format!("{root_base}{rel}");
     let body = json!({ "name": file_name, "url": full_url });
     let created: Value = ctx.client().send_json_value(

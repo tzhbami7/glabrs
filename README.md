@@ -58,6 +58,8 @@ Files live in `~/.config/glabrs/`:
 - `hosts.toml` — per host: `token`, `api_url`, `ca_file`, `client_cert`/`client_key`, custom `headers`
 
 Precedence: flags > env (`GLABRS_HOST`, `GITLAB_HOST`, `GITLAB_TOKEN`) > per-host > global.
+Empty or whitespace-only env values count as unset and fall through to the
+next source (the same rule as `GITLAB_TOKEN`, below).
 
 ### Token precedence
 
@@ -83,6 +85,10 @@ derived URLs always use `https://`.
 
 Note: credentials are stored with unix permissions (0600) and the binary
 targets unix systems (Linux, macOS).
+
+Note: MSRV. `rust-version` tracks the oldest toolchain the pinned
+`Cargo.lock` actually builds (1.88 today; several locked crates ship
+edition-2024 manifests and rustc >= 1.86 requirements). CI proves it.
 
 ## Self-hosted connection guide
 
@@ -118,8 +124,12 @@ api_url = "https://gitlab.corp.example/gitlab/api/v4"
 ```
 
 Hostnames are normalized (case-insensitive; `:443`/`:80` are treated as the
-default ports), so `auth login --hostname GitLab.Corp.Example:443` and a
-checkout on `https://gitlab.corp.example/...` resolve to the same entry.
+default ports; scheme forms keep only the authority — any `user:token@`
+credentials and URL path are stripped), so
+`auth login --hostname GitLab.Corp.Example:443` and a checkout on
+`https://gitlab.corp.example/...` resolve to the same entry. A custom header
+whose name/value cannot be sent safely (CR/LF, `:` in the name, control
+characters) is rejected as a usage error before any request.
 
 ### Escape hatch
 
@@ -144,7 +154,8 @@ token travels over an unverified connection). Prefer `ca_file`.
 - `--verbose` prints API method and path only — never headers or tokens.
 - `--description-file -` reads stdin. `mr diff` (and `--web`-less long views)
   use `GLABRS_PAGER` > `PAGER` > config `pager` > `less`; `--no-pager`
-  bypasses it.
+  bypasses it. `mr create --fill` titles the MR from the newest commit's
+  subject (with its body as the description).
 - `-R` accepts a numeric ID, `owner/name`, `group/sub/name`, an
   already-encoded path, or a full URL with a path — a bare URL with no path
   (`https://gitlab.com`) is a usage error, and a URL pointing at a different

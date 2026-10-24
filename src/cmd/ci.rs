@@ -93,6 +93,11 @@ fn status(root: &Root, ref_: Option<&str>, wait: bool, timeout: Option<u64>) -> 
     if let Some(r) = ref_ {
         query.push(("ref".into(), r.to_string()));
     }
+    // Explicit latest-first ordering instead of relying on GitLab's default
+    // list sort: `trace` (find_job) uses order_by=id&sort=desc, and both
+    // commands must agree on which pipeline "latest" names.
+    query.push(("order_by".into(), "id".into()));
+    query.push(("sort".into(), "desc".into()));
     let mut pipeline: Value = ctx
         .client()
         .get_json_value(&format!("projects/{pp}/pipelines"), &query)?

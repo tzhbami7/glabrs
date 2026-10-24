@@ -25,14 +25,17 @@ jobs:
         run: cargo test --all-features --locked
 
   msrv:
-    # The crate declares rust-version = 1.81; prove it compiles there so an
-    # accidental newer-lang feature cannot slip into a "supports 1.81" release.
+    # The crate declares rust-version = 1.88; prove it compiles there so an
+    # accidental newer-lang feature cannot slip into a "supports 1.88" release.
+    # (1.81 became unprovable in practice: crates in the current lock ship
+    # edition-2024 manifests and rustc >= 1.86 requirements, which cargo 1.81
+    # cannot even parse.)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.81.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
-      - name: Build (MSRV 1.81)
+      - name: Build (MSRV 1.88)
         run: cargo check --locked --all-features
 
   audit:

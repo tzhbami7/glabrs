@@ -39,17 +39,10 @@ fn login(
     ca_file: Option<&String>,
     api_url: Option<&String>,
 ) -> Result<(), Error> {
-    let hostname = match hostname_flag
-        .cloned()
-        .or_else(|| std::env::var("GLABRS_HOST").ok())
-        .or_else(|| std::env::var("GITLAB_HOST").ok())
-    {
-        Some(h) => crate::cmd::normalize_host(&h),
-        None => {
-            return Err(Error::usage(
-                "auth login requires --hostname (or set GLABRS_HOST/GITLAB_HOST)",
-            ))
-        }
+    let Some(hostname) = explicit_target(hostname_flag) else {
+        return Err(Error::usage(
+            "auth login requires --hostname (or set GLABRS_HOST/GITLAB_HOST)",
+        ));
     };
 
     // Token: --token > stdin (`-`) > hidden prompt.
@@ -127,17 +120,26 @@ fn explicit_target(hostname_flag: Option<&String>) -> Option<String> {
     )
 }
 
+/// A value that is present and non-blank, normalized like every host source.
+///
+/// Empty and whitespace-only values count as unset — the same
+/// exported-empty-variable CI artifact `resolve` guards against for
+/// `GITLAB_TOKEN` and the host env vars.
+fn normalized_nonempty(v: Option<String>) -> Option<String> {
+    v.map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .map(|h| crate::cmd::normalize_host(&h))
+}
+
 /// Pure precedence ladder: flag > `GLABRS_HOST` > `GITLAB_HOST`.
 fn explicit_target_from(
     hostname_flag: Option<&String>,
     glabrs_host: Option<String>,
     gitlab_host: Option<String>,
 ) -> Option<String> {
-    hostname_flag
-        .cloned()
-        .or(glabrs_host)
-        .or(gitlab_host)
-        .map(|h| crate::cmd::normalize_host(&h))
+    normalized_nonempty(hostname_flag.cloned())
+        .or_else(|| normalized_nonempty(glabrs_host))
+        .or_else(|| normalized_nonempty(gitlab_host))
 }
 
 fn status(root: &Root, hosts: &Hosts, hostname_flag: Option<&String>) -> Result<(), Error> {
@@ -398,6 +400,15 @@ mod tests {
 
         // Everything empty: sweep every configured host.
         assert_eq!(explicit_target_from(None, None, None), None);
+
+        // Empty / whitespace-only env values count as unset, like the token
+        // and host env vars elsewhere (exported-empty CI artifacts).
+        assert_eq!(
+            explicit_target_from(None, Some(String::new()), Some("env.example".into())).as_deref(),
+            Some("env.example")
+        );
+        assert_eq!(explicit_target_from(None, Some("   ".into()), None), None);
+        assert_eq!(explicit_target_from(Some(&String::new()), None, None), None);
 
         // Values are normalized like everywhere else.
         let got = explicit_target_from(None, Some("GitLab.Corp.Example:443".into()), None);

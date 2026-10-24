@@ -2,7 +2,7 @@
 name = "glabrs"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.88"
 description = "Lean, fast CLI for self-hosted GitLab"
 license = "MIT"
 keywords = ["gitlab", "cli", "self-hosted"]

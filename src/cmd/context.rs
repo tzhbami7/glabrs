@@ -29,6 +29,10 @@ fn detect_ci() -> Option<CiEnv> {
 ///
 /// The schemeless remainder is canonicalized by [`canonical_host`]
 /// (`src/git`): lowercased, default ports dropped, FQDN trailing dot trimmed.
+/// For scheme forms only the authority is kept: any path/query is dropped (a
+/// path-prefixed instance must set `api_url` explicitly — a hostname entry
+/// never contains a path), and `user:token@host` credentials are stripped so
+/// they can never leak into the stored hostname or an error message.
 ///
 /// # Examples
 ///
@@ -37,19 +41,45 @@ fn detect_ci() -> Option<CiEnv> {
 ///
 /// assert_eq!(normalize_host("GitLab.Corp.Example:443"), "gitlab.corp.example");
 /// assert_eq!(normalize_host("https://h.example/"), "h.example");
+/// // Credentials and path are not part of the host.
+/// assert_eq!(normalize_host("https://user:tok@h.example/prefix"), "h.example");
 /// // Custom ports are kept distinct.
 /// assert_eq!(normalize_host("h.example:8443"), "h.example:8443");
 /// ```
 #[must_use]
 pub fn normalize_host(h: &str) -> String {
     let s = h.trim();
-    if let Some(rest) = s.strip_prefix("https://") {
-        return crate::git::canonical_host(rest.trim_end_matches('/'));
+    let authority = if let Some(rest) = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+    {
+        // Authority only: a path-prefixed instance is configured via api_url.
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        &rest[..end]
+    } else {
+        s
+    };
+    // `user:token@host`: only the part after the last `@` is the host
+    // (`@` cannot appear in a host, so rsplit is safe for userinfo with `@`).
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    crate::git::canonical_host(authority)
+}
+
+/// Read the first usable host from the given env vars (in order).
+///
+/// Empty and whitespace-only values count as unset — the same
+/// exported-empty-variable CI artifact [`token_flag`] guards against for
+/// `GITLAB_TOKEN`. The survivor is normalized like every host source.
+fn env_host(vars: &[&str]) -> Option<String> {
+    for var in vars {
+        if let Ok(h) = std::env::var(var) {
+            let h = h.trim();
+            if !h.is_empty() {
+                return Some(normalize_host(h));
+            }
+        }
     }
-    if let Some(rest) = s.strip_prefix("http://") {
-        return crate::git::canonical_host(rest.trim_end_matches('/'));
-    }
-    crate::git::canonical_host(s)
+    None
 }
 
 /// Decide which host a command targets when it was detected from the git
@@ -92,14 +122,12 @@ pub fn target_hostname(root: &Root) -> Result<String, Error> {
     if let Some(h) = root.hostname.as_deref() {
         return Ok(normalize_host(h));
     }
-    for var in ["GLABRS_HOST", "GITLAB_HOST"] {
-        if let Ok(h) = std::env::var(var) {
-            return Ok(normalize_host(&h));
-        }
+    if let Some(h) = env_host(&["GLABRS_HOST", "GITLAB_HOST"]) {
+        return Ok(h);
     }
     if let Ok(api_url) = std::env::var("CI_API_V4_URL") {
         // host_of_api_url already returns a canonical host.
-        if let Some(host) = crate::api::client::host_of_api_url(&api_url) {
+        if let Some(host) = crate::api::client::host_of_api_url(api_url.trim()) {
             return Ok(host);
         }
     }
@@ -141,16 +169,8 @@ pub fn resolve(root: &Root, hostname_flag: Option<&str>) -> Result<Ctx, Error> {
     let ci = detect_ci();
     let hostname = match hostname_flag
         .map(normalize_host)
-        .or_else(|| {
-            std::env::var("GLABRS_HOST")
-                .ok()
-                .map(|ref h| normalize_host(h))
-        })
-        .or_else(|| {
-            std::env::var("GITLAB_HOST")
-                .ok()
-                .map(|ref h| normalize_host(h))
-        }) {
+        .or_else(|| env_host(&["GLABRS_HOST", "GITLAB_HOST"]))
+    {
         Some(h) => h,
         None => match &ci {
             Some(env) => crate::api::client::host_of_api_url(&env.api_url)
@@ -163,8 +183,7 @@ pub fn resolve(root: &Root, hostname_flag: Option<&str>) -> Result<Ctx, Error> {
         },
     };
     let ci = ci.filter(|env| {
-        crate::api::client::host_of_api_url(&env.api_url)
-            .map_or(true, |ci_host| ci_host == hostname)
+        crate::api::client::host_of_api_url(&env.api_url).is_none_or(|ci_host| ci_host == hostname)
     });
 
     let host_cfg = hosts
@@ -197,11 +216,14 @@ pub fn resolve(root: &Root, hostname_flag: Option<&str>) -> Result<Ctx, Error> {
         if let Some(table) = h.as_table() {
             for (k, v) in table {
                 if let Some(vs) = v.as_str() {
+                    // Per-host entries keep their position; the global value
+                    // only fills keys the host did not set.
                     headers.entry(k.clone()).or_insert_with(|| vs.to_string());
                 }
             }
         }
     }
+    validate_headers(&headers)?;
 
     let settings = crate::api::client::HostSettings { api_url, headers };
     let agent = build_agent(&host_cfg, root.insecure)?;
@@ -370,6 +392,39 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     }
 }
 
+/// Validate configured custom header names and values before any request.
+///
+/// `ureq` writes request headers verbatim to the wire: a `hosts.toml` header
+/// containing CR/LF (or a name with `:` or whitespace) would corrupt the
+/// request framing, and the failure would surface deep inside the agent as a
+/// confusing transport error. Failing at config-load time with the offending
+/// header's name turns it into an ordinary usage-time error.
+///
+/// Rules (loosely RFC 9110, matching what can actually break the wire): the
+/// name is nonempty visible ASCII without `:`, space, or tab; the value is a
+/// single line of visible ASCII plus spaces/tabs, no leading/trailing
+/// whitespace. An empty value is legal HTTP and allowed.
+fn validate_headers(headers: &std::collections::BTreeMap<String, String>) -> Result<(), Error> {
+    for (k, v) in headers {
+        let valid_name = !k.is_empty()
+            && k.bytes()
+                .all(|b| b.is_ascii_graphic() && b != b':' && b != b' ' && b != b'\t');
+        let valid_value = v
+            .bytes()
+            .all(|b| (0x21..=0x7E).contains(&b) || b == b' ' || b == b'\t')
+            && !v.starts_with([' ', '\t'])
+            && !v.ends_with([' ', '\t']);
+        if !valid_name || !valid_value {
+            return Err(Error::usage(format!(
+                "invalid custom header {k:?}: names must be visible ASCII \
+                 without ':', values a single line without leading/trailing \
+                 spaces; fix config.toml or hosts.toml"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Handle --insecure warning at dispatch time.
 pub fn warn_insecure(root: &Root) {
     if root.insecure {
@@ -479,6 +534,62 @@ mod tests {
         assert_eq!(token_flag(Some(&String::new())), None);
         assert_eq!(token_flag(Some(&"   ".into())), None);
         assert_eq!(token_flag(None), None);
+    }
+
+    #[test]
+    fn normalize_host_strips_credentials_and_path() {
+        // Scheme forms keep only the authority: credentials never leak into
+        // the stored hostname, and a path is not silently folded into one.
+        assert_eq!(
+            normalize_host("https://user:tok@GitLab.Corp.Example"),
+            "gitlab.corp.example"
+        );
+        assert_eq!(
+            normalize_host("https://git@gitlab.corp.example"),
+            "gitlab.corp.example"
+        );
+        assert_eq!(
+            normalize_host("https://gitlab.corp.example/gitlab"),
+            "gitlab.corp.example"
+        );
+        assert_eq!(
+            normalize_host("http://user@h.example:8443/prefix?q=1"),
+            "h.example:8443"
+        );
+    }
+
+    #[test]
+    fn validate_headers_accepts_normal_and_empty_values() {
+        let mut ok = std::collections::BTreeMap::new();
+        ok.insert("X-Custom".to_string(), "value".to_string());
+        ok.insert("X-Empty".to_string(), String::new());
+        ok.insert("Private-Token".to_string(), "a b\tc".to_string());
+        assert!(validate_headers(&ok).is_ok());
+    }
+
+    #[test]
+    fn validate_headers_rejects_framing_breakers() {
+        let cases: Vec<(String, String)> = vec![
+            // CR/LF anywhere corrupts the request framing.
+            ("X-A".into(), "v\r\nHost: evil".into()),
+            ("X-A".into(), "v\nHost: evil".into()),
+            // A colon in the name splits the header line.
+            ("X-A: B".into(), "v".into()),
+            // Control bytes and non-ASCII in the value.
+            ("X-A".into(), "bad\u{7F}value".into()),
+            ("X-A".into(), "bad\u{00E9}value".into()),
+            // Whitespace-padded value (would render as an obs-fold risk).
+            ("X-A".into(), " padded ".into()),
+            // Empty or whitespace-only name.
+            (String::new(), "v".into()),
+            ("  ".into(), "v".into()),
+        ];
+        for (k, v) in cases {
+            let mut headers = std::collections::BTreeMap::new();
+            headers.insert(k, v);
+            let err = validate_headers(&headers).expect_err("must reject");
+            assert_eq!(err.exit_code(), 2, "case: {err}");
+        }
     }
 
     fn hosts_with(entries: &[&str]) -> config::hosts::Hosts {
