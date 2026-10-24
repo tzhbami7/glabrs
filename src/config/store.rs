@@ -163,9 +163,50 @@ fn ensure_table<'a>(root: &'a mut toml::Value, key: &str) -> &'a mut toml::Value
     let parts: Vec<&str> = key.split('.').collect();
     for part in &parts[..parts.len().saturating_sub(1)] {
         if !cur.get(part).is_some_and(toml::Value::is_table) {
-            cur[part] = toml::Value::Table(toml::map::Map::new());
+            // Insert through the Map API: `cur[part] = ...` panics in toml 0.8
+            // when the key does not exist yet ("index not found"), which made
+            // `config set headers.X-Custom v` abort on a fresh config.toml.
+            if let Some(t) = cur.as_table_mut() {
+                t.insert(
+                    (*part).to_string(),
+                    toml::Value::Table(toml::map::Map::new()),
+                );
+            }
         }
-        cur = &mut cur[part];
+        cur = cur
+            .get_mut(part)
+            .expect("intermediate table was just inserted");
     }
     cur
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_dotted_key_on_empty_config_creates_intermediate_tables() {
+        // Regression: `cur[part] = Table` panicked on a missing key in toml
+        // 0.8, so `config set headers.X-Custom v` aborted with a panic on a
+        // fresh (or header-less) config.toml instead of creating the table.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        let mut cfg = Config::load_from(&path).expect("load");
+        cfg.set("headers.X-Custom", toml::Value::String("abc".into()));
+        assert_eq!(
+            cfg.get_str("headers.X-Custom").as_deref(),
+            Some("abc"),
+            "roundtrip through get/get_str"
+        );
+        // A second set into the same table, and a save/load cycle, keep it.
+        cfg.set("headers.Y-Other", toml::Value::String("d".into()));
+        cfg.save().expect("save");
+        let mut cfg = Config::load_from(&path).expect("reload");
+        assert_eq!(cfg.get_str("headers.X-Custom").as_deref(), Some("abc"));
+        assert_eq!(cfg.get_str("headers.Y-Other").as_deref(), Some("d"));
+        // Overwriting a non-table value at an intermediate position works too.
+        cfg.set("headers", toml::Value::String("oops".into()));
+        cfg.set("headers.Z", toml::Value::String("e".into()));
+        assert_eq!(cfg.get_str("headers.Z").as_deref(), Some("e"));
+    }
 }

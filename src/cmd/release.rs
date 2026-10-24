@@ -201,17 +201,7 @@ fn upload(
         .ok_or_else(|| Error::runtime(format!("unexpected upload url: {url}")))?;
     // instance_root echoes unparseable api_urls unchanged; never paste that
     // into a link URL (same guard as web_base_from_api).
-    let root_base = crate::api::client::instance_root(&ctx.client().api_url);
-    let root_base = url::Url::parse(&root_base)
-        .ok()
-        .filter(|u| u.host_str().is_some() && matches!(u.scheme(), "http" | "https"))
-        .map(|u| u.to_string())
-        .ok_or_else(|| {
-            Error::runtime(format!(
-                "cannot derive instance root from {}",
-                ctx.client().api_url
-            ))
-        })?;
+    let root_base = instance_root_link_base(&ctx.client().api_url)?;
     let full_url = format!("{root_base}{rel}");
     let body = json!({ "name": file_name, "url": full_url });
     let created: Value = ctx.client().send_json_value(
@@ -247,14 +237,16 @@ fn upload_file(
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
     let url = ctx.client().url(&format!("projects/{pp}/uploads"), &[]);
-    // agent_post already applies auth (token + per-host headers).
+    // agent_post already applies auth (token + per-host headers); the retry
+    // helper adds the same single 429 Retry-After as the JSON getters.
     let req = ctx.client().agent_post(&url)?;
-    let resp = req
-        .set(
+    let resp = ctx.client().send_bytes_with_retry(
+        req.set(
             "Content-Type",
             &format!("multipart/form-data; boundary={boundary}"),
-        )
-        .send_bytes(&body)?;
+        ),
+        &body,
+    )?;
     crate::api::client::decode_json(resp)
 }
 
@@ -329,6 +321,25 @@ fn guess_content_type(name: &str) -> String {
     }
 }
 
+/// The instance root as a link-URL base: parsed absolute http(s) with a host
+/// (`instance_root` echoes unparseable input unchanged), trailing slash
+/// trimmed. The trim matters: `Url::to_string()` serializes a bare authority
+/// with one (`https://h.example/`), so `format!("{base}{rel}")` with a
+/// root-relative `/uploads/...` path produced `//uploads/...` link URLs for
+/// non-prefixed instances.
+///
+/// # Errors
+///
+/// Returns [`Error::Runtime`] when the instance root cannot be derived.
+fn instance_root_link_base(api_url: &str) -> Result<String, Error> {
+    let root_base = crate::api::client::instance_root(api_url);
+    url::Url::parse(&root_base)
+        .ok()
+        .filter(|u| u.host_str().is_some() && matches!(u.scheme(), "http" | "https"))
+        .map(|u| u.to_string().trim_end_matches('/').to_string())
+        .ok_or_else(|| Error::runtime(format!("cannot derive instance root from {api_url}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +374,38 @@ mod tests {
         let second = random_boundary().unwrap();
         assert_ne!(first, second);
         assert_eq!(first.len(), 32);
+    }
+
+    #[test]
+    fn instance_root_link_base_never_double_slashes() {
+        // Regression: a bare-host instance root serializes with a trailing
+        // slash (`Url::to_string()`), which made upload link URLs
+        // `https://h.example//uploads/...` for non-prefixed instances.
+        assert_eq!(
+            instance_root_link_base("https://h.example/api/v4").unwrap(),
+            "https://h.example"
+        );
+        // Prefixed instances keep their path and no slash is added.
+        assert_eq!(
+            instance_root_link_base("https://h.example/gitlab/api/v4").unwrap(),
+            "https://h.example/gitlab"
+        );
+        // http (no-TLS instances keep their scheme) and custom ports.
+        assert_eq!(
+            instance_root_link_base("http://h.internal:8080/api/v4").unwrap(),
+            "http://h.internal:8080"
+        );
+        // No /api/v4 suffix: scheme + host from the URL itself.
+        assert_eq!(
+            instance_root_link_base("https://h.example/custom").unwrap(),
+            "https://h.example"
+        );
+        // Unparseable input is refused instead of becoming a garbage link.
+        assert_eq!(
+            instance_root_link_base("not a url")
+                .unwrap_err()
+                .exit_code(),
+            1
+        );
     }
 }

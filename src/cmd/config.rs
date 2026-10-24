@@ -39,8 +39,20 @@ fn get(_root: &Root, key: Option<&str>, hostname: Option<&str>) -> Result<(), Er
                 return Ok(());
             }
         }
-        match cfg.get_str(k) {
-            Some(v) => println!("{v}"),
+        match cfg.get(k) {
+            // A table (e.g. `headers`) dumps as TOML — its leaves are settable
+            // and honored, so they must be readable back whole, too.
+            Some(v) if v.is_table() => {
+                let text = toml::to_string_pretty(v)
+                    .map_err(|e| Error::runtime(format!("config.toml: {e}")))?;
+                println!("{text}");
+            }
+            Some(v) if let Some(s) = v.as_str() => println!("{s}"),
+            Some(_) => {
+                return Err(Error::usage(format!(
+                    "key {k} holds a non-string value; read it via `config get` (full dump) or a dotted subkey"
+                )))
+            }
             None => return Err(Error::not_found(format!("unknown key {k}"))),
         }
     } else {
@@ -53,10 +65,24 @@ fn get(_root: &Root, key: Option<&str>, hostname: Option<&str>) -> Result<(), Er
                 lines.push(format!("{k} = {v}"));
             }
         }
+        // The global custom headers table: shown one entry per line so the
+        // dump stays readable; the values are exactly what `resolve` sends.
+        if let Some(t) = cfg.get("headers").and_then(toml::Value::as_table) {
+            for (k, v) in t {
+                if let Some(vs) = v.as_str() {
+                    lines.push(format!("headers.{k} = {vs}"));
+                }
+            }
+        }
         if let Some(hc) = &host {
             for k in ["api_url", "ca_file", "client_cert", "client_key"] {
                 if let Some(v) = host_field_str(hc, k) {
                     lines.push(format!("{k} = {v}"));
+                }
+            }
+            if let Some(t) = hc.headers.as_ref() {
+                for (k, v) in t {
+                    lines.push(format!("headers.{k} = {v}"));
                 }
             }
             if hc.token.is_some() {

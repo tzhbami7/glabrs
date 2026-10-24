@@ -39,13 +39,14 @@ jobs:
         run: cargo check --locked --all-features
 
   audit:
-    # Dependencies advisory check for a credentials-handling CLI.
+    # Dependencies advisory check for a credentials-handling CLI. The binary
+    # install keeps this job at seconds instead of a full source build of
+    # cargo-audit on every run.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
       - name: Security audit
         run: cargo audit

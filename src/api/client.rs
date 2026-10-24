@@ -280,22 +280,40 @@ impl Client {
         // With no body, send an explicit empty JSON object: ureq's plain
         // `call()` would carry no payload at all, which stricter servers and
         // reverse proxies reject, and `send_string` alone would set
-        // text/plain. `send_json(&{})` is byte-identical to the explicit
-        // Content-Type + "{}" dance it replaces. Built once, borrowed for
-        // both the first attempt and a possible retry.
+        // text/plain. `Value::to_string()` is the same compact form
+        // `send_json` serializes to; the Content-Type header that `send_json`
+        // would set is applied explicitly so the retry helper's `send_bytes`
+        // path reaches the wire identically.
         let empty = Value::Object(serde_json::Map::new());
         let payload = body.unwrap_or(&empty);
-        // A 429 response was never processed by the server, so replaying the
-        // request once is safe for every method (`ureq::Request` is Clone, so
-        // the second attempt carries the same headers and body).
-        let resp = match req.clone().send_json(payload.clone()) {
-            Err(ureq::Error::Status(429, r)) => {
-                Self::sleep_retry_after(&r);
-                req.send_json(payload.clone())?
-            }
-            other => other?,
-        };
+        let req = req.set("Content-Type", "application/json");
+        let resp = self.send_bytes_with_retry(req, payload.to_string().as_bytes())?;
         decode_json(resp)
+    }
+
+    /// Send raw bytes with an already-prepared request, honoring a single
+    /// `Retry-After` on HTTP 429 — the same policy as the JSON getters.
+    ///
+    /// A 429 response was never processed by the server, so replaying the
+    /// request once is safe for every method (`ureq::Request` is Clone, so
+    /// the second attempt carries the same headers and body). Used by the
+    /// multipart upload path, which previously skipped the retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] when either attempt fails.
+    pub fn send_bytes_with_retry(
+        &self,
+        req: ureq::Request,
+        bytes: &[u8],
+    ) -> Result<ureq::Response, Error> {
+        match req.clone().send_bytes(bytes) {
+            Err(ureq::Error::Status(429, resp)) => {
+                Self::sleep_retry_after(&resp);
+                Ok(req.send_bytes(bytes)?)
+            }
+            other => Ok(other?),
+        }
     }
 
     /// Build the request URL: `api_url` + path + percent-encoded query string.
@@ -398,13 +416,31 @@ pub fn decode_json(resp: ureq::Response) -> Result<Value, Error> {
 ///
 /// Canonical like every host source (see
 /// [`crate::git::canonical_host`]): lowercased, default ports dropped,
-/// trailing FQDN dot trimmed — so a `CI_API_V4_URL` of
+/// non-default ports kept, trailing FQDN dot trimmed — so a `CI_API_V4_URL` of
 /// `https://GitLab.Corp.Example:443` resolves to the same hosts.toml entry as
-/// `auth login --hostname gitlab.corp.example`.
+/// `auth login --hostname gitlab.corp.example`, and `:8443` spellings match
+/// the `:8443` entry on every source.
+///
+/// # Examples
+///
+/// ```
+/// use glabrs::api::client::host_of_api_url;
+///
+/// assert_eq!(host_of_api_url("https://h.example:8443/api/v4").as_deref(), Some("h.example:8443"));
+/// assert_eq!(host_of_api_url("https://H.Example:443/api/v4").as_deref(), Some("h.example"));
+/// ```
 #[must_use]
 pub fn host_of_api_url(api_url: &str) -> Option<String> {
     let u = url::Url::parse(api_url).ok()?;
-    u.host_str().map(crate::git::canonical_host)
+    let host = u.host_str()?;
+    // Reattach a non-default port so a CI_API_V4_URL of
+    // `https://h.example:8443/api/v4` resolves to the same hosts.toml entry
+    // `auth login --hostname h.example:8443` writes (canonical_host keeps it).
+    let host = match u.port() {
+        Some(p) if !matches!(p, 443 | 80) => format!("{host}:{p}"),
+        _ => host.to_string(),
+    };
+    Some(crate::git::canonical_host(&host))
 }
 
 /// Reduce an API URL to the instance root:
@@ -573,14 +609,18 @@ mod tests {
         // Same host, same entry — the url crate separates the port from
         // host_str, and canonical_host trims the FQDN trailing dot the url
         // crate preserves (a CI_API_V4_URL spelling that must still match the
-        // hosts.toml entry stored by auth login).
+        // hosts.toml entry stored by auth login). Non-default ports stay.
         assert_eq!(
             host_of_api_url("https://GitLab.Corp.Example:443/api/v4"),
             Some("gitlab.corp.example".to_string())
         );
         assert_eq!(
+            host_of_api_url("https://h.example:8443/api/v4"),
+            Some("h.example:8443".to_string())
+        );
+        assert_eq!(
             host_of_api_url("http://h.internal.:8080/api/v4"),
-            Some("h.internal".to_string())
+            Some("h.internal:8080".to_string())
         );
         assert_eq!(host_of_api_url("not a url"), None);
     }

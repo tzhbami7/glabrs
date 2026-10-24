@@ -440,7 +440,8 @@ pub fn warn_insecure(root: &Root) {
 /// exported-empty-variable artifact) reaches the flag as `Some("")` — treating
 /// that as a token would send an anonymous request instead of falling through
 /// to `CI_JOB_TOKEN` or the stored token. Empty means unset.
-fn token_flag(flag: Option<&String>) -> Option<String> {
+#[must_use]
+pub fn token_flag(flag: Option<&String>) -> Option<String> {
     // One allocation: trim borrows, the owned String is created only for the
     // value that is actually returned.
     flag.map(String::as_str)

@@ -739,6 +739,66 @@ fn ci_status_snapshot_running_exits_zero() {
 }
 
 #[test]
+fn custom_port_instance_matches_across_host_sources() {
+    // Regression for the split host identity: a checkout on h.example:8443
+    // and `auth login --hostname h.example:8443` must resolve to the same
+    // hosts.toml entry (the old code stored the bare host from remote
+    // detection and the ported host from the flag, so ported checkouts
+    // missed their entry). End-to-end through dispatch: the entry is found,
+    // the request goes to the configured http api_url, no mismatch error.
+    let (base, rx) = spawn_server(|req| {
+        if req.path.contains("/merge_requests") {
+            (
+                200,
+                vec![],
+                json_body(&serde_json::json!(
+                    [{"iid": 1, "title": "T", "state": "opened"}]
+                )),
+            )
+        } else {
+            (200, vec![], json_body(&serde_json::json!({})))
+        }
+    });
+    // Hostname flag carries the non-default port (host_of includes it for a
+    // mock base); the stored hosts.toml entry uses the same spelling (as
+    // `auth login --hostname` would write it).
+    let host = host_of(&base).to_string();
+    let root = glabrs::cli::Root {
+        repo: None,
+        hostname: Some(host.clone()),
+        token: None,
+        insecure: false,
+        json: false,
+        no_pager: true,
+        verbose: false,
+        command: glabrs::cli::Command::Mr {
+            command: glabrs::cli::mr_cmd::MrArgs::List {
+                assignee: None,
+                reviewer: None,
+                author: None,
+                state: None,
+                list: glabrs::cli::ListOpts {
+                    per_page: 20,
+                    page: None,
+                    paginate: false,
+                },
+            },
+        },
+    };
+    // -R carries the ported URL exactly like the git remote would parse it.
+    let mut root = root;
+    root.repo = Some(format!("{base}/group/proj"));
+    let (_out, _err, result) = dispatch_captured(&host, &base, &root);
+    result.expect("ported checkout must resolve the ported hosts.toml entry");
+    let req = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    assert!(
+        req.path.contains("projects/group%2Fproj/merge_requests"),
+        "{}",
+        req.path
+    );
+}
+
+#[test]
 fn config_unset_missing_key_is_not_found() {
     // The no-op unset contract: unknown key exits 4 on the global side.
     // (Exercise the pure store-level equivalent: Config::unset returns false

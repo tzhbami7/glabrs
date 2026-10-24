@@ -45,11 +45,18 @@ fn login(
         ));
     };
 
-    // Token: --token > stdin (`-`) > hidden prompt.
+    // Token ladder: stdin (`-`) > the subcommand's --token > GITLAB_TOKEN
+    // (via the global flag, which clap populates from the env; both share
+    // the empty-means-unset rule) > hidden prompt. `-` is an explicit
+    // "read stdin" choice and short-circuits before the ladder.
     let token = match token_arg.map(String::as_str) {
         Some("-") => read_input("-")?.trim().to_string(),
-        Some(t) => t.to_string(),
-        None => rpassword::prompt_password(format!("Paste token for {hostname}: "))?,
+        _ => match crate::cmd::token_flag(token_arg)
+            .or_else(|| crate::cmd::token_flag(root.token.as_ref()))
+        {
+            Some(t) => t,
+            None => rpassword::prompt_password(format!("Paste token for {hostname}: "))?,
+        },
     };
     if token.is_empty() {
         return Err(Error::auth("empty token"));
@@ -73,7 +80,15 @@ fn login(
         api_url: api_url
             .map(String::as_str)
             .map_or_else(|| format!("https://{hostname}/api/v4"), str::to_string),
-        headers: std::collections::BTreeMap::new(),
+        // A host already configured behind a proxy must reach the instance
+        // the same way during validation as after storing (its custom
+        // headers), or a technically valid token is rejected here.
+        headers: Hosts::load()?
+            .get(&hostname)
+            .cloned()
+            .unwrap_or_default()
+            .headers
+            .unwrap_or_default(),
     };
     let client = crate::api::Client::new(
         agent,
@@ -246,7 +261,9 @@ fn probe(root: &Root, hosts: &Hosts, hostname: &str) -> HostReport {
         let agent = crate::cmd::build_agent(&host_cfg, root.insecure)?;
         let settings = crate::api::client::HostSettings {
             api_url: api_url.clone(),
-            headers: std::collections::BTreeMap::new(),
+            // Per-host custom headers (proxy auth etc.) apply to the probe
+            // exactly like to every other command against this host.
+            headers: host_cfg.headers.unwrap_or_default(),
         };
         let client = crate::api::Client::new(
             agent,

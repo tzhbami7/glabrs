@@ -52,7 +52,8 @@ glabrs api projects/42/issues --paginate --page 2 | jq '.[].title'
 
 ## Configuration
 
-Files live in `~/.config/glabrs/`:
+Files live in the platform config dir: `~/.config/glabrs/` on Linux,
+`~/Library/Application Support/glabrs/` on macOS:
 
 - `config.toml` — global settings (`api_url`, `pager`, custom `headers`)
 - `hosts.toml` — per host: `token`, `api_url`, `ca_file`, `client_cert`/`client_key`, custom `headers`
@@ -65,7 +66,9 @@ next source (the same rule as `GITLAB_TOKEN`, below).
 
 `--token` flag (= `GITLAB_TOKEN` env, applied by clap) > `CI_JOB_TOKEN` (when in CI) > stored token.
 An empty or whitespace-only `GITLAB_TOKEN` counts as unset and falls through to
-the next source.
+the next source. `auth login` honors the same head of the ladder: the
+subcommand's `--token` beats `GITLAB_TOKEN`; `--token -` explicitly reads the
+token from stdin.
 
 Note: a token passed as `--token <value>` is visible to other local users via
 the process list (`ps`). On shared machines prefer `GITLAB_TOKEN`
@@ -124,10 +127,14 @@ api_url = "https://gitlab.corp.example/gitlab/api/v4"
 ```
 
 Hostnames are normalized (case-insensitive; `:443`/`:80` are treated as the
-default ports; scheme forms keep only the authority — any `user:token@`
+default ports and dropped; **non-default ports are part of the host identity
+on every source** — `auth login --hostname`, `--hostname`, env, `CI_API_V4_URL`,
+`-R` URLs, and git-remote detection all canonicalize to the same
+`host:8443` spelling; scheme forms keep only the authority — any `user:token@`
 credentials and URL path are stripped), so
 `auth login --hostname GitLab.Corp.Example:443` and a checkout on
-`https://gitlab.corp.example/...` resolve to the same entry. A custom header
+`https://gitlab.corp.example/...` resolve to the same entry, and a
+`:8443` checkout matches the `:8443` entry `auth login` wrote. A custom header
 whose name/value cannot be sent safely (CR/LF, `:` in the name, control
 characters) is rejected as a usage error before any request.
 
